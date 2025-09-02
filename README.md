@@ -78,6 +78,7 @@ Ou use os scripts:
 - `NTFY_TEST` se definido, envia uma notificação de teste no arranque
 
 Notas
+
 - O programa fecha graciosamente com Ctrl+C (SIGINT/SIGTERM) após concluir o ciclo corrente.
 - Resposta vazia do endpoint (0 incidentes) é aceite sem erro.
 - `NTFY_TOPIC` tópico para notificação (opcional)

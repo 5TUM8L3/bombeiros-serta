@@ -76,17 +76,17 @@ Ou use os scripts:
 - `FOGOS_API_KEY` token opcional (se necessário pelo endpoint)
 - `STATE_FILE` caminho do ficheiro de estado (def: `last_ids.json`)
 - `NTFY_TEST` se definido, envia uma notificação de teste no arranque
+- `DEBUG` ou `LOG_LEVEL=debug` ativa logs de debug
+- `NTFY_DRYRUN=1` não envia para ntfy (apenas loga a mensagem)
+- `NTFY_SUMMARY_THRESHOLD` número mínimo de novos incidentes num ciclo para enviar um resumo agregado em vez de 1 push por incidente (ex.: `5`)
+- `QUIET_HOURS` janela de horas de silêncio no formato `23-7`; reduz prioridade para 3 e adiciona tag `zzz`
 
 Notas
 
 - O programa fecha graciosamente com Ctrl+C (SIGINT/SIGTERM) após concluir o ciclo corrente.
 - Resposta vazia do endpoint (0 incidentes) é aceite sem erro.
-- `NTFY_TOPIC` tópico para notificação (opcional)
-- `NTFY_URL` servidor do ntfy (default `https://ntfy.sh`)
-- `STATE_FILE` caminho do ficheiro de estado (default `last_ids.json`)
-- `FOGOS_URL` endpoint principal (default API v2 de Fogos)
-- `FOGOS_FALLBACK_URLS` endereços alternativos, separados por vírgula/espaço/`;`
-- `FOGOS_API_KEY` token opcional para Authorization: Bearer
+- Caching HTTP condicional: o cliente usa ETag/Last-Modified no endpoint principal e evita downloads quando não há alterações (HTTP 304).
+- Push mais rico: inclui natureza e estado quando disponíveis, e um link Click para abrir no Google Maps (coordenadas GeoJSON) ou pesquisa pelo município.
 
 ## Estado
 
@@ -94,6 +94,6 @@ O ficheiro `last_ids.json` mantém, por município normalizado, os IDs já notif
 
 ## Notas
 
-- Normalização de municípios remove acentos e espaços para equivalência, com alguns sinónimos comuns.
+- Normalização de municípios remove acentos e espaços para equivalência, com alguns sinónimos comuns (inclui chave `municipality`).
 - Cabeçalhos "amigáveis" para evitar bloqueios de WAF/CDN.
 - Binário único, leve e adequado a correr 24/7 como Task agendada ou Serviço.

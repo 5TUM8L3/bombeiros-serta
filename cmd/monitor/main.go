@@ -6,15 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"sort"
-	"strings"
 	"strconv"
+	"strings"
 	"time"
 
 	"context"
@@ -576,11 +576,15 @@ func extractFogosURLFromBody(body string) string {
 
 // Canonicalize seen map keys according to wantedSet and known corrections
 func canonicalizeSeenKeys(seen perMuniSeen, wantedSet map[string][]string) perMuniSeen {
-	if seen == nil { return perMuniSeen{} }
+	if seen == nil {
+		return perMuniSeen{}
+	}
 	aliasToCanon := map[string]string{}
 	for canon, alts := range wantedSet {
 		aliasToCanon[canon] = canon
-		for _, a := range alts { aliasToCanon[a] = canon }
+		for _, a := range alts {
+			aliasToCanon[a] = canon
+		}
 	}
 	corrections := map[string]string{
 		"sert":             "serta",
@@ -591,9 +595,15 @@ func canonicalizeSeenKeys(seen perMuniSeen, wantedSet map[string][]string) perMu
 	out := perMuniSeen{}
 	for k, kv := range seen {
 		nk := k
-		if v, ok := corrections[nk]; ok { nk = v }
-		if v, ok := aliasToCanon[nk]; ok { nk = v }
-		if out[nk] == nil { out[nk] = map[string]time.Time{} }
+		if v, ok := corrections[nk]; ok {
+			nk = v
+		}
+		if v, ok := aliasToCanon[nk]; ok {
+			nk = v
+		}
+		if out[nk] == nil {
+			out[nk] = map[string]time.Time{}
+		}
 		for id, ts := range kv {
 			out[nk][id] = ts
 		}
@@ -775,7 +785,9 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				continue
 			}
 			// mark last seen for ids present in this cycle
-			if seen[muniKey] == nil { seen[muniKey] = map[string]time.Time{} }
+			if seen[muniKey] == nil {
+				seen[muniKey] = map[string]time.Time{}
+			}
 			seen[muniKey][id] = now
 			if _, ok := st[muniKey][id]; !ok {
 				st[muniKey][id] = struct{}{}

@@ -1,162 +1,85 @@
-# David-Bombeiros
+# David-Bombeiros (Go)
 
-Script simples em Bun que consulta os incidentes ativos (GeoJSON) de Fogos.pt e filtra apenas o concelho "Sertã". Opcionalmente envia notificação para ntfy.sh.
+Monitor de incidentes ativos (GeoJSON) de Fogos.pt filtrado por municípios (Sertã e vizinhos). Envia alertas opcionais via ntfy.
 
-## Pré-requisitos
+## Requisitos
 
-- [Bun](https://bun.sh/) instalado e no PATH
+- Go 1.22+
+- Windows (funciona também em Linux/macOS)
 
-## Como executar
-
-### CMD (Prompt de Comando)
-
-```
-cd /d E:\David-Bombeiros
-bun install
-bun run start
-```
-
-### PowerShell
-
-```
-Set-Location E:\David-Bombeiros
-bun install
-bun run start
-```
-
-## Notificação opcional (ntfy)
-
-Para receber notificações push via [ntfy.sh](https://ntfy.sh/):
-
-1. Escolha um tópico (ex.: `bombeiros-serta`).
-2. Na app ntfy do telemóvel, subscreva o tópico (server: https://ntfy.sh).
-3. Execute com o tópico:
-
-CMD:
-
-```
-cd /d E:\David-Bombeiros
-set NTFY_TOPIC=bombeiros-serta && bun run start
-```
+## Build rápido
 
 PowerShell:
 
 ```
-Set-Location E:\David-Bombeiros
-$env:NTFY_TOPIC = 'bombeiros-serta'
-bun run start
-```
-
-Servidor personalizado (opcional):
-
-```
-set NTFY_URL=https://ntfy.sh
-```
-
-Teste rápido de notificação (sem consultar API):
-
-CMD:
-
-```
-cd /d E:\David-Bombeiros
-set NTFY_TOPIC=bombeiros-serta && set NTFY_TEST=1 && bun run start
-```
-
-PowerShell:
-
-```
-Set-Location E:\David-Bombeiros
-$env:NTFY_TOPIC = 'bombeiros-serta'
-$env:NTFY_TEST = '1'
-bun run start
-```
-
-## Saída
-
-O script imprime um JSON com:
-
-- `count`: número de ocorrências em Sertã
-- `features`: array GeoJSON de ocorrências filtradas
-
-## Vários municípios
-
-Pode monitorizar vários municípios de uma só vez. Defina a variável `MUNICIPIOS` como lista separada por vírgulas ou ponto-e-vírgula, por exemplo:
-
-PowerShell:
-
-```
-Set-Location E:\David-Bombeiros
-$env:MUNICIPIOS = 'Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova,Vila de Rei,Vila Velha de Ródão,Sardoal,Figueiró dos Vinhos,Pampilhosa da Serra'
-$env:NTFY_TOPIC = 'bombeiros-serta'
-bun run start
+Set-Location E:\bombeiros-serta
+go build -o bin/monitor.exe ./cmd/monitor
 ```
 
 CMD:
 
 ```
-cd /d E:\David-Bombeiros
-set MUNICIPIOS=Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova,Vila de Rei,Vila Velha de Ródão,Sardoal,Figueiró dos Vinhos,Pampilhosa da Serra
-set NTFY_TOPIC=bombeiros-serta && bun run start
+cd /d E:\bombeiros-serta
+go build -o bin\monitor.exe .\cmd\monitor
 ```
 
-Se `MUNICIPIOS` não for definido, o padrão já inclui estes municípios.
+## Execução
 
-## Polling contínuo
-
-Para monitorizar automaticamente (por omissão a cada 30s) e enviar alerta quando houver alterações:
-
-CMD:
-
-```
-cd /d E:\David-Bombeiros
-set NTFY_TOPIC=bombeiros-serta && set POLL_SECONDS=60 && bun run start
-```
+- Uma só vez (sem polling):
 
 PowerShell:
 
 ```
-Set-Location E:\David-Bombeiros
+$env:POLL_SECONDS = '0'
+& .\bin\monitor.exe
+```
+
+CMD:
+
+```
+set POLL_SECONDS=0 && bin\monitor.exe
+```
+
+- Contínuo (padrão 30s):
+
+PowerShell:
+
+```
 $env:NTFY_TOPIC = 'bombeiros-serta'
 $env:POLL_SECONDS = '60'
-bun run start
+& .\bin\monitor.exe
 ```
 
-Ou use o script pronto `monitor.ps1` (mantém estado entre reinícios):
+CMD:
 
 ```
-Set-Location E:\David-Bombeiros
-./monitor.ps1 -Municipio 'Sertã' -PollSeconds 30 -Topic 'bombeiros-serta'  # (opcional: usa 1 município)
-
-Ou, no CMD, use `monitor.bat` (também com 30s por omissão):
-
+set NTFY_TOPIC=bombeiros-serta && set POLL_SECONDS=60 && bin\monitor.exe
 ```
 
-cd /d E:\David-Bombeiros
-monitor.bat "Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova,Vila de Rei,Vila Velha de Ródão,Sardoal,Figueiró dos Vinhos,Pampilhosa da Serra" 30 bombeiros-serta
+Ou use os scripts:
 
-```
+- `monitor.ps1` (PowerShell)
+- `monitor.bat` (CMD)
 
-```
+## Variáveis de ambiente
 
-Para manter sempre ativo após reiniciar o Windows, use o Agendador de Tarefas:
+- `MUNICIPIOS` lista separada por vírgula ou ponto-e-vírgula. Ex.:
+  - PowerShell: `$env:MUNICIPIOS = 'Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova'`
+  - CMD: `set MUNICIPIOS=Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova`
+- `POLL_SECONDS` intervalo em segundos (0 executa só uma vez)
+- `NTFY_TOPIC` tópico para notificação (opcional)
+- `NTFY_URL` servidor do ntfy (default `https://ntfy.sh`)
+- `STATE_FILE` caminho do ficheiro de estado (default `last_ids.json`)
+- `FOGOS_URL` endpoint principal (default API v2 de Fogos)
+- `FOGOS_FALLBACK_URLS` endereços alternativos, separados por vírgula/espaço/`;`
+- `FOGOS_API_KEY` token opcional para Authorization: Bearer
 
-1. Abra o Agendador de Tarefas > Criar Tarefa.
-2. Em Disparadores, "Ao iniciar sessão" ou "Ao iniciar".
-3. Em Ações, pode escolher uma destas opções:
-   - Usando PowerShell:
-     - Programa/script: `powershell.exe`
-     - Argumentos: `-ExecutionPolicy Bypass -NoProfile -File E:\David-Bombeiros\monitor.ps1 -Municipio 'Sertã' -PollSeconds 30 -Topic 'bombeiros-serta'`
-     - Iniciar em: `E:\David-Bombeiros`
-   - Usando BAT (CMD):
-     - Programa/script: `E:\David-Bombeiros\monitor.bat`
-     - Iniciar em: `E:\David-Bombeiros`
-4. Marque "Executar com privilégios mais elevados" se necessário e guarde.
+## Estado
 
-PowerShell:
+O ficheiro `last_ids.json` mantém, por município normalizado, os IDs já notificados, evitando alertas repetidos entre reinícios.
 
-```
-Set-Location E:\David-Bombeiros
-$env:NTFY_TOPIC = 'bombeiros-serta'
-$env:POLL_SECONDS = '60'
-bun run start
-```
+## Notas
+
+- Normalização de municípios remove acentos e espaços para equivalência, com alguns sinónimos comuns.
+- Cabeçalhos "amigáveis" para evitar bloqueios de WAF/CDN.
+- Binário único, leve e adequado a correr 24/7 como Task agendada ou Serviço.

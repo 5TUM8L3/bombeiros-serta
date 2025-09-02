@@ -22,3 +22,13 @@ out/
 .env
 .env.local
 .env.*.local
+
+# Go
+bin/
+*.exe
+*.out
+*.test
+coverage*
+go.work
+go.work.sum
+**/.vscode/

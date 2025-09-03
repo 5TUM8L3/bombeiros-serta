@@ -32,3 +32,4 @@ coverage*
 go.work
 go.work.sum
 **/.vscode/
+last_ids.json

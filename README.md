@@ -1,50 +1,64 @@
-# Bombeiros-Serta (Go)
+# Bombeiros Sertã Monitor (Go)
 
-Monitor de incidentes ativos (GeoJSON) de Fogos.pt filtrado por municípios (Sertã e vizinhos). Envia alertas opcionais via ntfy.
+Watches active incidents (GeoJSON) from Fogos.pt and filters them by municipalities (Sertã and nearby by default). Sends optional push alerts via ntfy and exports Prometheus metrics.
 
-## Requisitos
+## Features
+
+- Polls Fogos.pt “active incidents” API (GeoJSON)
+- Municipality filtering with accent/whitespace normalization and common synonyms
+- Additional filters: districts, regions, subregions, parishes; include-by-nature; exclude-by-status
+- Optional radius filter around a center coordinate
+- De-duplication across restarts using a local state file
+- ntfy notifications with tags, priority, quiet hours, and dry-run mode
+- Optional aggregation: send a single summary when many new incidents appear in one cycle
+- Rich notifications: nature, status, and a Click link to Google Maps (coords or municipality search)
+- Conditional HTTP caching (ETag/Last-Modified) to avoid unnecessary downloads (304)
+- Graceful shutdown on Ctrl+C/SIGTERM after finishing the current cycle
+- Prometheus metrics for current counts and status dynamics
+
+## Requirements
 
 - Go 1.22+
-- Windows (funciona também em Linux/macOS)
+- Windows (also works on Linux/macOS)
 
-## Build rápido
+## Quick build
 
 PowerShell:
 
-```
+```powershell
 Set-Location E:\bombeiros-serta
 go build -o bin/monitor.exe ./cmd/monitor
 ```
 
 CMD:
 
-```
+```bat
 cd /d E:\bombeiros-serta
 go build -o bin\monitor.exe .\cmd\monitor
 ```
 
-## Execução
+## Run
 
-- Uma só vez (sem polling):
+- One-off run (no polling):
 
 PowerShell:
 
-```
+```powershell
 $env:POLL_SECONDS = '0'
 & .\bin\monitor.exe
 ```
 
 CMD:
 
-```
+```bat
 set POLL_SECONDS=0 && bin\monitor.exe
 ```
 
-- Contínuo (padrão 30s):
+- Continuous run (e.g., 60s; default is 30s):
 
 PowerShell:
 
-```
+```powershell
 $env:NTFY_TOPIC = 'bombeiros-serta'
 $env:POLL_SECONDS = '60'
 & .\bin\monitor.exe
@@ -52,48 +66,90 @@ $env:POLL_SECONDS = '60'
 
 CMD:
 
-```
+```bat
 set NTFY_TOPIC=bombeiros-serta && set POLL_SECONDS=60 && bin\monitor.exe
 ```
 
-Ou use os scripts:
+## Configuration (environment variables)
 
-- `monitor.ps1` (PowerShell)
-- `monitor.bat` (CMD)
+Core
 
-## Variáveis de ambiente
-
-- `MUNICIPIOS` lista separada por vírgula ou ponto-e-vírgula. Ex.:
+- MUNICIPIOS: Comma- or semicolon-separated list of municipality names to monitor. Example:
   - PowerShell: `$env:MUNICIPIOS = 'Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova'`
   - CMD: `set MUNICIPIOS=Sertã,Oleiros,Castanheira de Pera,Proença-a-Nova`
-- `POLL_SECONDS` intervalo em segundos (0 executa só uma vez)
-- `NTFY_URL` URL base do ntfy (def: `https://ntfy.sh`)
-- `NTFY_TOPIC` tópico do ntfy (def: `bombeiros-serta`)
-- `NTFY_PRIORITY` prioridade ntfy 1–5 (def: `5`)
-- `NTFY_TAGS` tags/emojis (def: `fire,rotating_light`)
-- `FOGOS_URL` endpoint de incidents ativos (def: `https://api.fogos.pt/v2/incidents/active?geojson=true`)
-- `FOGOS_FALLBACK_URLS` lista de endpoints fallback separados por vírgula/; (opcional)
-- `FOGOS_API_KEY` token opcional (se necessário pelo endpoint)
-- `STATE_FILE` caminho do ficheiro de estado (def: `last_ids.json`)
-- `NTFY_TEST` se definido, envia uma notificação de teste no arranque
-- `DEBUG` ou `LOG_LEVEL=debug` ativa logs de debug
-- `NTFY_DRYRUN=1` não envia para ntfy (apenas loga a mensagem)
-- `NTFY_SUMMARY_THRESHOLD` número mínimo de novos incidentes num ciclo para enviar um resumo agregado em vez de 1 push por incidente (ex.: `5`)
-- `QUIET_HOURS` janela de horas de silêncio no formato `23-7`; reduz prioridade para 3 e adiciona tag `zzz`
+- POLL_SECONDS: Poll interval in seconds (0 runs once and exits)
+- STATE_FILE: Path to the state file (default: `last_ids.json`)
+- STATE_TTL_HOURS: Optional TTL to prune old IDs from state (e.g., `72`)
 
-Notas
+Fogos API
 
-- O programa fecha graciosamente com Ctrl+C (SIGINT/SIGTERM) após concluir o ciclo corrente.
-- Resposta vazia do endpoint (0 incidentes) é aceite sem erro.
-- Caching HTTP condicional: o cliente usa ETag/Last-Modified no endpoint principal e evita downloads quando não há alterações (HTTP 304).
-- Push mais rico: inclui natureza e estado quando disponíveis, e um link Click para abrir no Google Maps (coordenadas GeoJSON) ou pesquisa pelo município.
+- FOGOS_URL: Active incidents endpoint (default: `https://api.fogos.pt/v2/incidents/active?geojson=true`)
+- FOGOS_FALLBACK_URLS: Optional comma/semicolon list of fallback endpoints
+- FOGOS_API_KEY: Optional API token if required by the endpoint
 
-## Estado
+Filtering (admin units / attributes)
 
-O ficheiro `last_ids.json` mantém, por município normalizado, os IDs já notificados, evitando alertas repetidos entre reinícios.
+- DISTRICTS: Case-insensitive list of district names
+- REGIOES: Case-insensitive list of regions (NUTS2/3 as provided by the API)
+- SUBREGIOES: Case-insensitive list of subregions
+- FREGUESIAS: Case-insensitive list of parish names
+- INCLUDE_NATUREZA: Case-insensitive list of nature strings (substring match)
+- EXCLUDE_STATUS_CODES: Comma-separated integer codes to exclude
 
-## Notas
+Radius filter (optional)
 
-- Normalização de municípios remove acentos e espaços para equivalência, com alguns sinónimos comuns (inclui chave `municipality`).
-- Cabeçalhos "amigáveis" para evitar bloqueios de WAF/CDN.
-- Binário único, leve e adequado a correr 24/7 como Task agendada ou Serviço.
+- CENTER_LAT, CENTER_LON: Center point in decimal degrees
+- RADIUS_KM: Radius in kilometers (enabled if > 0)
+
+ntfy (notifications)
+
+- NTFY_URL: Base ntfy URL (default: `https://ntfy.sh`)
+- NTFY_TOPIC: Topic to publish to (default: `bombeiros-serta`)
+- NTFY_PRIORITY: ntfy priority 1–5 (default: `5`)
+- NTFY_TAGS: Comma list of tags/emojis (default: `fire,rotating_light`)
+- NTFY_DRYRUN: If set, do not post to ntfy; log the message only
+- NTFY_SUMMARY_THRESHOLD: If > 0, send an aggregated summary when the number of new incidents in a cycle meets/exceeds the threshold (e.g., `5`)
+- QUIET_HOURS: Quiet window `start-end` in 24h format (e.g., `23-7`); lowers priority and adds a `zzz` tag
+- NTFY_TEST: If set, sends a test notification on startup
+
+Logging & Metrics
+
+- DEBUG or LOG_LEVEL=debug: Enable debug logs
+- METRICS_DISABLE: If set, disables metrics export
+- SUMMARY_HOURLY / SUMMARY_DAILY: Set to `0` to disable hourly/daily summaries
+
+Optional means-based enrichment
+
+- MIN_MAN, MIN_TERRAIN, MIN_AERIAL, MIN_AQUATIC: Integer thresholds that add tags and bump priority when exceeded
+
+## State file
+
+The file `last_ids.json` stores, per normalized municipality, the IDs that were already notified to avoid duplicates across restarts. It also records timestamps such as first seen and concluded when available, and the last known status per incident.
+
+## Metrics
+
+Exports Prometheus metrics (when not disabled):
+
+- bombeiros_active_incidents (gauge) with labels like district/concelho/regiao/natureza/status
+- bombeiros_status_transitions_total (counter)
+- bombeiros_time_to_conclusion_seconds (histogram)
+
+An HTTP `/metrics` endpoint is exposed when metrics are enabled. Check the startup log to see where it is served.
+
+## Notes & behavior
+
+- Empty responses from the API (0 incidents) are treated as valid
+- Google Maps “Click” link is included when coordinates are available, otherwise a municipality search link is used
+- Municipality names are normalized (accents/spacing removed) and common synonyms are recognized
+- Uses friendly HTTP headers and conditional GET (ETag/Last-Modified) to reduce bandwidth
+- Gracefully handles Ctrl+C/SIGTERM: completes the current cycle before exiting
+
+## Project layout
+
+- `cmd/monitor/main.go` – Application entry point
+- `last_ids.json` – State file (created/updated at runtime)
+- `monitor.exe` – Binary (if you build to project root)
+
+## Disclaimer
+
+This is a lightweight, single-binary tool intended to run 24/7 (task scheduler/service) or on-demand. Always verify incident information with official sources.

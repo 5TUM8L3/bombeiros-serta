@@ -5,21 +5,47 @@
     "castelobranco": [],
     "covilha": [],
     "ferreiradozezere": [],
-    "figueirdosvinhos": [],
     "figueirodosvinhos": [],
-    "fundao": [],
+    "fundao": [
+      "20251181815"
+    ],
     "idanhaanova": [],
     "oleiros": [],
     "pampilhosadaserra": [],
     "pedrogaogrande": [],
     "penamacor": [],
-    "proenaanova": [],
     "proencaanova": [],
     "sardoal": [],
-    "sert": [],
     "serta": [],
     "viladerei": [],
-    "vilavelhaderdo": [],
     "vilavelhaderodao": []
+  },
+  "concluded": {},
+  "first": {
+    "20251181815": "2025-09-03T14:31:02Z"
+  },
+  "seen": {
+    "belmonte": {},
+    "castanheiradepera": {},
+    "castelobranco": {},
+    "covilha": {},
+    "ferreiradozezere": {},
+    "figueirodosvinhos": {},
+    "fundao": {
+      "20251181815": "2025-09-03T14:31:02Z"
+    },
+    "idanhaanova": {},
+    "oleiros": {},
+    "pampilhosadaserra": {},
+    "pedrogaogrande": {},
+    "penamacor": {},
+    "proencaanova": {},
+    "sardoal": {},
+    "serta": {},
+    "viladerei": {},
+    "vilavelhaderodao": {}
+  },
+  "status": {
+    "20251181815": "Despacho de 1º Alerta"
   }
 }

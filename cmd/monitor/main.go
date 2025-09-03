@@ -20,6 +20,9 @@ import (
 	"context"
 	"unicode"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/text/runes"
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
@@ -159,6 +162,24 @@ func debugf(format string, a ...any) {
 		fmt.Printf("[debug] "+format+"\n", a...)
 	}
 }
+
+// Metrics
+var (
+	metricsEnabled  bool
+	activeIncidents = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "bombeiros_active_incidents",
+		Help: "Active incidents count with labels",
+	}, []string{"district", "concelho", "regiao", "natureza", "status"})
+	statusTransitions = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "bombeiros_status_transitions_total",
+		Help: "Total number of status transitions",
+	}, []string{"from", "to"})
+	timeToConclusion = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "bombeiros_time_to_conclusion_seconds",
+		Help:    "Time from first seen to conclusion",
+		Buckets: prometheus.LinearBuckets(300, 900, 20), // 5min start, +15min, 20 buckets ~ 5h
+	})
+)
 
 func doGet(url string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -319,6 +340,10 @@ func getMunicipio(p map[string]any) string {
 type perMuniState map[string]map[string]struct{}
 type perMuniSeen map[string]map[string]time.Time
 
+// Additional state: status per ID and first/concluded timestamps (UTC)
+type idStatusMap map[string]string
+type idTimeMap map[string]time.Time
+
 func loadLastState(path string) (perMuniState, perMuniSeen, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -360,11 +385,38 @@ func loadLastState(path string) (perMuniState, perMuniSeen, error) {
 			}
 		}
 	}
+	// Extended maps: status, first, concluded
+	if m, ok := raw["status"].(map[string]any); ok {
+		for id, v := range m {
+			if s, ok := v.(string); ok {
+				lastStatusByID[id] = s
+			}
+		}
+	}
+	if m, ok := raw["first"].(map[string]any); ok {
+		for id, v := range m {
+			if s, ok := v.(string); ok {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					firstSeenByID[id] = t
+				}
+			}
+		}
+	}
+	if m, ok := raw["concluded"].(map[string]any); ok {
+		for id, v := range m {
+			if s, ok := v.(string); ok {
+				if t, err := time.Parse(time.RFC3339, s); err == nil {
+					concludedAtID[id] = t
+				}
+			}
+		}
+	}
+	// Optional migration: legacy files may not have these keys; that's fine
 	return st, seen, nil
 }
 
 func saveLastState(path string, st perMuniState, seen perMuniSeen) error {
-	raw := map[string]any{"by": map[string][]string{}, "seen": map[string]map[string]string{}}
+	raw := map[string]any{"by": map[string][]string{}, "seen": map[string]map[string]string{}, "status": map[string]string{}, "first": map[string]string{}, "concluded": map[string]string{}}
 	for muni, set := range st {
 		ids := make([]string, 0, len(set))
 		for id := range set {
@@ -379,6 +431,21 @@ func saveLastState(path string, st perMuniState, seen perMuniSeen) error {
 			out[id] = ts.UTC().Format(time.RFC3339)
 		}
 		seenOut[muni] = out
+	}
+	// Save extended maps
+	stOut := raw["status"].(map[string]string)
+	for id, s := range lastStatusByID {
+		if strings.TrimSpace(id) != "" && strings.TrimSpace(s) != "" {
+			stOut[id] = s
+		}
+	}
+	fstOut := raw["first"].(map[string]string)
+	for id, ts := range firstSeenByID {
+		fstOut[id] = ts.UTC().Format(time.RFC3339)
+	}
+	cOut := raw["concluded"].(map[string]string)
+	for id, ts := range concludedAtID {
+		cOut[id] = ts.UTC().Format(time.RFC3339)
 	}
 	b, _ := json.MarshalIndent(raw, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
@@ -453,6 +520,13 @@ func prettyTime(val any) string {
 		if v > 0 {
 			return time.Unix(int64(v), 0).Local().Format("02-01 15:04")
 		}
+	case map[string]any:
+		// Support {"sec": ...}
+		if sec, ok := v["sec"]; ok {
+			if f, ok2 := toFloat(sec); ok2 && f > 0 {
+				return time.Unix(int64(f), 0).Local().Format("02-01 15:04")
+			}
+		}
 	}
 	return ""
 }
@@ -466,6 +540,16 @@ func toFloat(v any) (float64, bool) {
 		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
 			return f, true
 		}
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f, true
+		}
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case uint64:
+		return float64(t), true
 	}
 	return 0, false
 }
@@ -551,6 +635,10 @@ func getPropStr(p map[string]any, keys ...string) string {
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
 				return s
 			}
+			// Accept numbers
+			if f, ok := toFloat(v); ok {
+				return fmt.Sprintf("%.0f", f)
+			}
 		}
 	}
 	return ""
@@ -572,6 +660,21 @@ func extractFogosURLFromBody(body string) string {
 		j++
 	}
 	return body[i:j]
+}
+
+func extractURLAfterPrefix(body, prefix string) string {
+	i := strings.Index(body, prefix)
+	if i < 0 {
+		return ""
+	}
+	j := i + len(prefix)
+	for j < len(body) {
+		if body[j] == '\n' || body[j] == '\r' || body[j] == ' ' || body[j] == '\t' {
+			break
+		}
+		j++
+	}
+	return strings.TrimSpace(body[i+len(prefix) : j])
 }
 
 // Canonicalize seen map keys according to wantedSet and known corrections
@@ -654,6 +757,11 @@ func postNtfyExt(ntfyURL, topic, title, body, tags, priority, clickURL string) {
 	if urlFogos := extractFogosURLFromBody(body); urlFogos != "" {
 		actions = append(actions, fmt.Sprintf("view, Abrir Fogos, %s", urlFogos))
 	}
+	if areaURL := extractURLAfterPrefix(body, "Área URL: "); areaURL != "" {
+		actions = append(actions, fmt.Sprintf("view, Abrir área, %s", areaURL))
+	} else if areaURL2 := extractURLAfterPrefix(body, "Area URL: "); areaURL2 != "" { // no accent fallback
+		actions = append(actions, fmt.Sprintf("view, Abrir area, %s", areaURL2))
+	}
 	if len(actions) > 0 {
 		req.Header.Set("Actions", strings.Join(actions, "; "))
 	}
@@ -708,6 +816,252 @@ func canonicalizeStateKeys(st perMuniState, wantedSet map[string][]string) perMu
 	return out
 }
 
+// Helpers for filtering
+func parseIntSetFromEnv(name string) map[int]struct{} {
+	set := map[int]struct{}{}
+	v := strings.TrimSpace(getenv(name, ""))
+	if v == "" {
+		return set
+	}
+	for _, p := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if i, err := strconv.Atoi(p); err == nil {
+			set[i] = struct{}{}
+		}
+	}
+	return set
+}
+
+func parseStrSetFromEnv(name string) map[string]struct{} {
+	set := map[string]struct{}{}
+	v := strings.TrimSpace(getenv(name, ""))
+	if v == "" {
+		return set
+	}
+	for _, p := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' || r == '|' }) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		set[strings.ToLower(stripAccents(p))] = struct{}{}
+	}
+	return set
+}
+
+func shouldKeepByAdminUnits(p map[string]any) bool {
+	// District
+	if ds := parseStrSetFromEnv("DISTRICTS"); len(ds) > 0 {
+		d := strings.ToLower(stripAccents(getPropStr(p, "district")))
+		if _, ok := ds[d]; !ok {
+			return false
+		}
+	}
+	if rs := parseStrSetFromEnv("REGIOES"); len(rs) > 0 {
+		r := strings.ToLower(stripAccents(getPropStr(p, "regiao")))
+		if _, ok := rs[r]; !ok {
+			return false
+		}
+	}
+	if srs := parseStrSetFromEnv("SUBREGIOES"); len(srs) > 0 {
+		sr := strings.ToLower(stripAccents(getPropStr(p, "sub_regiao")))
+		if _, ok := srs[sr]; !ok {
+			return false
+		}
+	}
+	if frs := parseStrSetFromEnv("FREGUESIAS"); len(frs) > 0 {
+		f := strings.ToLower(stripAccents(getPropStr(p, "freguesia")))
+		if _, ok := frs[f]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldKeepByNatureAndStatus(p map[string]any) bool {
+	// EXCLUDE_STATUS_CODES = comma-int list
+	if exc := parseIntSetFromEnv("EXCLUDE_STATUS_CODES"); len(exc) > 0 {
+		if scF, ok := toFloat(p["statusCode"]); ok {
+			sc := int(scF)
+			if _, bad := exc[sc]; bad {
+				return false
+			}
+		}
+	}
+	// INCLUDE_NATUREZA = case-insensitive list; match on natureza or naturezaCode
+	if inc := parseStrSetFromEnv("INCLUDE_NATUREZA"); len(inc) > 0 {
+		nz := strings.ToLower(stripAccents(getPropStr(p, "natureza")))
+		nzc := strings.ToLower(stripAccents(getPropStr(p, "naturezaCode")))
+		if _, ok := inc[nz]; ok {
+			return true
+		}
+		if _, ok := inc[nzc]; ok {
+			return true
+		}
+		// allow substring match
+		for want := range inc {
+			if want != "" && strings.Contains(nz, want) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// Enrichment: compute dynamic tags and suggested priority from means
+func enrichMeansTagsAndPriority(p map[string]any, baseTags, basePriority string) (string, string) {
+	get := func(name string) int {
+		if f, ok := toFloat(p[name]); ok {
+			return int(f)
+		}
+		return 0
+	}
+	man := get("man")
+	ter := get("terrain")
+	air := get("aerial")
+	aq := get("meios_aquaticos")
+	// thresholds (0 disables)
+	thMan, _ := strconv.Atoi(getenv("MIN_MAN", "0"))
+	thTer, _ := strconv.Atoi(getenv("MIN_TERRAIN", "0"))
+	thAir, _ := strconv.Atoi(getenv("MIN_AERIAL", "0"))
+	thAq, _ := strconv.Atoi(getenv("MIN_AQUATIC", "0"))
+	tags := baseTags
+	prio := basePriority
+	// lower numbers are higher priority in ntfy (1 max, 5 min)
+	bump := func(n int) {
+		if n <= 0 {
+			return
+		}
+		cur, _ := strconv.Atoi(func() string {
+			if strings.TrimSpace(prio) == "" {
+				return "5"
+			}
+			return prio
+		}())
+		if n < cur {
+			prio = strconv.Itoa(n)
+		}
+	}
+	if thMan > 0 && man >= thMan {
+		tags = addTag(tags, "man")
+		bump(2)
+	}
+	if thTer > 0 && ter >= thTer {
+		tags = addTag(tags, "terrain")
+		bump(3)
+	}
+	if thAir > 0 && air >= thAir {
+		tags = addTag(tags, "aerial")
+		bump(2)
+	}
+	if thAq > 0 && aq >= thAq {
+		tags = addTag(tags, "aquatic")
+		bump(3)
+	}
+	return tags, prio
+}
+
+func parseExtraTags(extra string) (tags []string, highlight string) {
+	s := strings.ToLower(stripAccents(extra))
+	if strings.Contains(s, "reabert") {
+		tags = append(tags, "white_check_mark")
+	}
+	if strings.Contains(s, "cortad") || strings.Contains(s, "encerrad") || strings.Contains(s, "fechad") || strings.Contains(s, "corte") {
+		tags = append(tags, "no_entry")
+	}
+	// keep original as highlight
+	highlight = extra
+	return
+}
+
+// KML VOST handling: save and compute area/perimeter
+func saveKMLAndCompute(kmlStr, saveDir, id string) (areaKm2, perimeterKm float64, fileURL string, saved bool, err error) {
+	if strings.TrimSpace(kmlStr) == "" || strings.TrimSpace(saveDir) == "" {
+		return 0, 0, "", false, nil
+	}
+	if err = os.MkdirAll(saveDir, 0755); err != nil {
+		return 0, 0, "", false, err
+	}
+	fname := fmt.Sprintf("%s.kml", id)
+	full := filepath.Join(saveDir, fname)
+	if writeErr := os.WriteFile(full, []byte(kmlStr), 0644); writeErr != nil {
+		return 0, 0, "", false, writeErr
+	}
+	// Make file URL
+	abs, _ := filepath.Abs(full)
+	uri := abs
+	if os.PathSeparator == '\\' {
+		uri = strings.ReplaceAll(abs, "\\", "/")
+		if !strings.HasPrefix(uri, "/") {
+			// Ensure leading slash like /C:/...
+			uri = "/" + uri
+		}
+		uri = "file://" + uri
+	} else {
+		uri = "file://" + uri
+	}
+	// Very simple polygon extraction
+	coordsStart := strings.Index(strings.ToLower(kmlStr), "<coordinates>")
+	coordsEnd := strings.Index(strings.ToLower(kmlStr), "</coordinates>")
+	if coordsStart > 0 && coordsEnd > coordsStart {
+		coordsText := kmlStr[coordsStart+13 : coordsEnd]
+		// parse lon,lat[,alt] tuples separated by space or newline
+		type pt struct{ lat, lon float64 }
+		var pts []pt
+		for _, tok := range strings.Fields(coordsText) {
+			parts := strings.Split(tok, ",")
+			if len(parts) >= 2 {
+				lon, e1 := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+				lat, e2 := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+				if e1 == nil && e2 == nil {
+					pts = append(pts, pt{lat: lat, lon: lon})
+				}
+			}
+		}
+		if len(pts) >= 3 {
+			// Compute area/perimeter with equirectangular projection around mean lat
+			var lat0 float64
+			for _, p := range pts {
+				lat0 += p.lat
+			}
+			lat0 /= float64(len(pts))
+			const R = 6371000.0
+			toXY := func(p pt) (x, y float64) {
+				x = (p.lon * math.Pi / 180) * R * math.Cos(lat0*math.Pi/180)
+				y = (p.lat * math.Pi / 180) * R
+				return
+			}
+			// Shoelace area and perimeter
+			var area2 float64
+			var per float64
+			for i := 0; i < len(pts); i++ {
+				j := (i + 1) % len(pts)
+				x1, y1 := toXY(pts[i])
+				x2, y2 := toXY(pts[j])
+				area2 += x1*y2 - x2*y1
+				dx := x2 - x1
+				dy := y2 - y1
+				per += math.Hypot(dx, dy)
+			}
+			areaKm2 = math.Abs(area2) / 2 / 1e6
+			perimeterKm = per / 1000
+		}
+	}
+	return areaKm2, perimeterKm, uri, true, nil
+}
+
+// In-memory status tracking for transitions and summaries
+var (
+	lastStatusByID  = map[string]string{}
+	firstSeenByID   = map[string]time.Time{}
+	concludedAtID   = map[string]time.Time{}
+	lastSummaryHour int
+	lastSummaryDay  string
+)
+
 func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	features, err := fetchActiveFeatures()
 	if err != nil {
@@ -715,6 +1069,14 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	}
 	wantedSet, wantedFlat := makeWantedSet(wantedNames)
 	filtered := filterByMunicipios(features, wantedFlat)
+	// Additional admin filters
+	tmp := make([]Feature, 0, len(filtered))
+	for _, f := range filtered {
+		if shouldKeepByAdminUnits(f.Properties) && shouldKeepByNatureAndStatus(f.Properties) {
+			tmp = append(tmp, f)
+		}
+	}
+	filtered = tmp
 	// Optional radius filter
 	centerLat, _ := strconv.ParseFloat(strings.TrimSpace(getenv("CENTER_LAT", "")), 64)
 	centerLon, _ := strconv.ParseFloat(strings.TrimSpace(getenv("CENTER_LON", "")), 64)
@@ -769,15 +1131,18 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 		}
 	}
 
-	// update last-seen for current active IDs and collect events for new ones
+	// update last-seen for current active IDs and collect events for new ones and status changes
 	type newEvent struct {
 		muniKey string
 		disp    string
 		id      string
 		when    string
 		f       Feature
+		prev    string
+		cur     string
 	}
 	events := make([]newEvent, 0, 8)
+	statusEvents := make([]newEvent, 0, 8)
 	for muniKey, feats := range perMuniNew {
 		for _, f := range feats {
 			id := getID(f.Properties)
@@ -797,11 +1162,36 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 					disp = muniKey
 				}
 				events = append(events, newEvent{muniKey: muniKey, disp: disp, id: id, when: when, f: f})
+				// first seen tracking
+				if _, ok := firstSeenByID[id]; !ok {
+					firstSeenByID[id] = now
+				}
+			}
+			// Status change detection
+			curStatus := getPropStr(f.Properties, "status")
+			prev := lastStatusByID[id]
+			if curStatus != "" && curStatus != prev {
+				statusEvents = append(statusEvents, newEvent{muniKey: muniKey, disp: getMunicipio(f.Properties), id: id, when: prettyTime(f.Properties["updated"]), f: f, prev: prev, cur: curStatus})
+				if prev != "" {
+					statusTransitions.WithLabelValues(prev, curStatus).Inc()
+				}
+				lastStatusByID[id] = curStatus
+				// conclusion timing
+				if strings.EqualFold(curStatus, "Conclusão") || strings.Contains(strings.ToLower(stripAccents(curStatus)), "conclus") {
+					concludedAtID[id] = now
+					if t0, ok := firstSeenByID[id]; ok && now.After(t0) {
+						timeToConclusion.Observe(now.Sub(t0).Seconds())
+					}
+				}
+				// Reactivation: previously concluded now active again
+				if (strings.Contains(strings.ToLower(stripAccents(prev)), "conclus") || strings.Contains(strings.ToLower(stripAccents(prev)), "vigil")) && (strings.Contains(strings.ToLower(stripAccents(curStatus)), "curso") || strings.Contains(strings.ToLower(stripAccents(curStatus)), "despacho")) {
+					// mark with special tag later via event fields
+				}
 			}
 		}
 	}
 
-	anyChange := len(events) > 0
+	anyChange := len(events) > 0 || len(statusEvents) > 0
 
 	// notify (aggregate or per-incident)
 	if anyChange {
@@ -831,33 +1221,108 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 			postNtfyExt(ntfyURL, topic, title, body, tags, priority, "")
 		} else {
 			for _, ev := range events {
-				status := getPropStr(ev.f.Properties, "status", "phase", "estado")
-				nature := getPropStr(ev.f.Properties, "natureza", "type", "tipo")
-				title := fmt.Sprintf("Novo incidente em %s", ev.disp)
+				p := ev.f.Properties
+				status := getPropStr(p, "status", "phase", "estado")
+				nature := getPropStr(p, "natureza", "type", "tipo")
+				man := getPropStr(p, "man")
+				ter := getPropStr(p, "terrain")
+				air := getPropStr(p, "aerial")
+				aq := getPropStr(p, "meios_aquaticos")
+				title := fmt.Sprintf("Novo em %s — %s", ev.disp, nature)
 				if ev.when != "" {
 					title += " (" + ev.when + ")"
 				}
-				body := fmt.Sprintf("ID: %s\nMunicípio: %s", ev.id, ev.disp)
-				if nature != "" {
-					body += "\nNatureza: " + nature
+				body := fmt.Sprintf("ID: %s\nMunicípio: %s\nEstado: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, ev.disp, status, man, ter, air, aq)
+				// Extra
+				if extra := getPropStr(p, "extra"); extra != "" {
+					_, hi := parseExtraTags(extra)
+					if hi != "" {
+						body += "\nExtra: " + hi
+					}
 				}
-				if status != "" {
-					body += "\nEstado: " + status
+				// KML area
+				if kml := getPropStr(p, "kmlVost", "kml"); kml != "" {
+					if areaKm2, perKm, areaURL, saved, _ := saveKMLAndCompute(kml, getenv("SAVE_KML_DIR", ""), ev.id); saved {
+						body += fmt.Sprintf("\nÁrea: %.2f km², Perímetro: %.1f km", areaKm2, perKm)
+						// Add area action by passing as clickURL? We'll prefer an action; we add URL in body so extractor can build action
+						body += "\nÁrea URL: " + areaURL
+					}
 				}
 				body += fmt.Sprintf("\nTotal ativo no alvo: %d", len(filtered))
 				clickURL := mapsURLForFeature(ev.f, ev.disp)
-				// Build Fogos URL (if ID available)
-				fogosURL := ""
+				// Embed Fogos URL hint
 				if ev.id != "" {
-					fogosURL = "https://fogos.pt/fogo/" + ev.id
+					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
 				}
-				// Include Actions header with both links when available
-				// Actions header is set inside postNtfyExt using body parse; we embed URL to detect
-				if fogosURL != "" {
-					// Append a hint line to body so extractor can add the action reliably
-					body += "\nFogos: " + fogosURL
+				// Enrich tags/priority based on means
+				tg, pr := enrichMeansTagsAndPriority(p, tags, priority)
+				// Extra tags from 'extra'
+				if extra := getPropStr(p, "extra"); extra != "" {
+					if more, _ := parseExtraTags(extra); len(more) > 0 {
+						for _, t := range more {
+							tg = addTag(tg, t)
+						}
+					}
 				}
-				postNtfyExt(ntfyURL, topic, title, body, tags, priority, clickURL)
+				postNtfyExt(ntfyURL, topic, title, body, tg, pr, clickURL)
+			}
+			// Send status-change notifications
+			for _, ev := range statusEvents {
+				p := ev.f.Properties
+				curStatus := getPropStr(p, "status")
+				prev := ev.prev
+				title := fmt.Sprintf("%s → %s — %s", func() string {
+					if strings.TrimSpace(prev) == "" {
+						return "Novo"
+					}
+					return prev
+				}(), curStatus, ev.disp)
+				man := getPropStr(p, "man")
+				ter := getPropStr(p, "terrain")
+				air := getPropStr(p, "aerial")
+				aq := getPropStr(p, "meios_aquaticos")
+				body := fmt.Sprintf("ID: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, man, ter, air, aq)
+				// Extra
+				if extra := getPropStr(p, "extra"); extra != "" {
+					_, hi := parseExtraTags(extra)
+					if hi != "" {
+						body += "\nExtra: " + hi
+					}
+				}
+				// Fogos link
+				if ev.id != "" {
+					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
+				}
+				// Adjust priority based on status
+				pr := priority
+				s := strings.ToLower(stripAccents(curStatus))
+				if strings.Contains(s, "despacho") {
+					pr = "4" // aviso inicial, menor prioridade
+				} else if strings.Contains(s, "em curso") || strings.Contains(s, "em resolucao") {
+					pr = "2" // ativo, prioridade alta
+				} else if strings.Contains(s, "vigilancia") || strings.Contains(s, "conclus") {
+					pr = "3"
+				}
+				tg, pr2 := enrichMeansTagsAndPriority(p, tags, pr)
+				// Reactivation or conclusion tags
+				prevS := strings.ToLower(stripAccents(prev))
+				if (strings.Contains(prevS, "conclus") || strings.Contains(prevS, "vigil")) && (strings.Contains(s, "curso") || strings.Contains(s, "despacho")) {
+					tg = addTag(tg, "repeat")
+					title = "Reativado: " + title
+					pr2 = "2"
+				}
+				if strings.Contains(s, "conclus") {
+					tg = addTag(tg, "white_check_mark")
+				}
+				// Extra tags
+				if extra := getPropStr(p, "extra"); extra != "" {
+					if more, _ := parseExtraTags(extra); len(more) > 0 {
+						for _, t := range more {
+							tg = addTag(tg, t)
+						}
+					}
+				}
+				postNtfyExt(ntfyURL, topic, title, body, tg, pr2, mapsURLForFeature(ev.f, ev.disp))
 			}
 		}
 	}
@@ -877,6 +1342,102 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				}
 			}
 		}
+	}
+
+	// Metrics gauges: reset then set counts for current filtered
+	if getenv("METRICS_DISABLE", "") == "" {
+		metricsEnabled = true
+		activeIncidents.Reset()
+		for _, f := range filtered {
+			p := f.Properties
+			activeIncidents.WithLabelValues(
+				getPropStr(p, "district"),
+				getPropStr(p, "concelho"),
+				getPropStr(p, "regiao"),
+				getPropStr(p, "natureza"),
+				getPropStr(p, "status"),
+			).Inc()
+		}
+	}
+
+	// Periodic summary (hourly/daily)
+	nowHour := now.Hour()
+	nowDay := now.Format("2006-01-02")
+	if getenv("SUMMARY_HOURLY", "1") != "0" && lastSummaryHour != nowHour {
+		// Build summary by concelho, natureza, estado
+		byConc := map[string]int{}
+		byNat := map[string]int{}
+		bySta := map[string]int{}
+		for _, f := range filtered {
+			p := f.Properties
+			byConc[getPropStr(p, "concelho")]++
+			byNat[getPropStr(p, "natureza")]++
+			bySta[getPropStr(p, "status")]++
+		}
+		mk := func(m map[string]int) string {
+			type kv struct {
+				k string
+				v int
+			}
+			arr := []kv{}
+			for k, v := range m {
+				arr = append(arr, kv{k, v})
+			}
+			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+			parts := []string{}
+			for i, e := range arr {
+				if i >= 6 {
+					break
+				}
+				parts = append(parts, fmt.Sprintf("%s: %d", e.k, e.v))
+			}
+			if len(parts) == 0 {
+				return "(n/a)"
+			}
+			return strings.Join(parts, ", ")
+		}
+		title := fmt.Sprintf("Sumário horário (%02d:00)", nowHour)
+		body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
+		postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "bar_chart"), "3", "")
+		lastSummaryHour = nowHour
+	}
+	if getenv("SUMMARY_DAILY", "1") != "0" && lastSummaryDay != nowDay && now.Hour() == 8 {
+		// Daily at ~08:00
+		byConc := map[string]int{}
+		byNat := map[string]int{}
+		bySta := map[string]int{}
+		for _, f := range filtered {
+			p := f.Properties
+			byConc[getPropStr(p, "concelho")]++
+			byNat[getPropStr(p, "natureza")]++
+			bySta[getPropStr(p, "status")]++
+		}
+		mk := func(m map[string]int) string {
+			type kv struct {
+				k string
+				v int
+			}
+			arr := []kv{}
+			for k, v := range m {
+				arr = append(arr, kv{k, v})
+			}
+			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+			parts := []string{}
+			for i, e := range arr {
+				if i >= 10 {
+					break
+				}
+				parts = append(parts, fmt.Sprintf("%s: %d", e.k, e.v))
+			}
+			if len(parts) == 0 {
+				return "(n/a)"
+			}
+			return strings.Join(parts, "; ")
+		}
+		title := fmt.Sprintf("Sumário diário (%s)", nowDay)
+		body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
+		postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "calendar"), "3", "")
+		lastSummaryDay = nowDay
 	}
 
 	// Save state when there were new events or TTL pruned entries
@@ -905,6 +1466,19 @@ func main() {
 	// Teste opcional de notificação no arranque (defina NTFY_TEST=1)
 	if getenv("NTFY_TEST", "") != "" {
 		postNtfyExt(getenv("NTFY_URL", "https://ntfy.sh"), getenv("NTFY_TOPIC", "bombeiros-serta"), "[teste] monitor iniciado", time.Now().Format(time.RFC3339), "white_check_mark", "3", "")
+	}
+
+	// Metrics endpoint
+	if getenv("METRICS_DISABLE", "") == "" {
+		addr := getenv("METRICS_ADDR", ":2112")
+		go func() {
+			mux := http.NewServeMux()
+			mux.Handle("/metrics", promhttp.Handler())
+			if err := http.ListenAndServe(addr, mux); err != nil {
+				fmt.Fprintln(os.Stderr, "metrics server error:", err)
+			}
+		}()
+		fmt.Println("Métricas Prometheus em", getenv("METRICS_ADDR", ":2112"), "/metrics")
 	}
 
 	// Graceful shutdown on Ctrl+C / SIGTERM

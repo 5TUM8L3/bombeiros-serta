@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -151,10 +150,7 @@ func defaultHeaders() http.Header {
 // Reusable HTTP client with sane timeout
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
-// ETag/Last-Modified cache (in-memory) for the primary endpoint
-var lastETag string
-var lastLastModified string
-var cachedFeatures []Feature
+// (Removed) ETag/Last-Modified cache vars
 
 // Lightweight debug logger (enable with LOG_LEVEL=debug or DEBUG=1)
 func debugf(format string, a ...any) {
@@ -165,7 +161,6 @@ func debugf(format string, a ...any) {
 
 // Metrics
 var (
-	metricsEnabled  bool
 	activeIncidents = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "bombeiros_active_incidents",
 		Help: "Active incidents count with labels",
@@ -201,111 +196,103 @@ func doGet(url string) (*http.Response, error) {
 }
 
 // GET with extra headers (for If-None-Match / If-Modified-Since)
-func doGetWithHeaders(url string, extra http.Header) (*http.Response, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header = defaultHeaders()
-	for k, vals := range extra {
-		for _, v := range vals {
-			req.Header.Add(k, v)
-		}
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("http %d GET %s: %s", resp.StatusCode, url, strings.TrimSpace(string(msg)))
-	}
-	return resp, nil
-}
+// removed unused doGetWithHeaders
 
 func fetchActiveFeatures() ([]Feature, error) {
-	base := strings.TrimSpace(getenv("FOGOS_URL", "https://api.fogos.pt/v2/incidents/active?geojson=true"))
-	fallbacks := strings.FieldsFunc(strings.TrimSpace(os.Getenv("FOGOS_FALLBACK_URLS")), func(r rune) bool { return r == ',' || r == ' ' || r == ';' })
-	urls := append([]string{base}, fallbacks...)
-	var lastErr error
-	for i, u := range urls {
-		var resp *http.Response
-		var err error
-		if i == 0 {
-			// Try conditional GET on the primary endpoint
-			extra := http.Header{}
-			if lastETag != "" {
-				extra.Set("If-None-Match", lastETag)
-			}
-			if lastLastModified != "" {
-				extra.Set("If-Modified-Since", lastLastModified)
-			}
-			resp, err = doGetWithHeaders(u, extra)
-		} else {
-			resp, err = doGet(u)
-		}
-		if err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
-			continue
-		}
-		if resp.StatusCode == http.StatusNotModified && cachedFeatures != nil {
-			_ = resp.Body.Close()
-			debugf("HTTP 304 Not Modified (using cached features)")
-			return cachedFeatures, nil
-		}
-		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
-			continue
-		}
-		features, err := toFeatures(data)
-		if err != nil {
-			lastErr = err
-			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
-			continue
-		}
-		if i == 0 { // update cache metadata only for primary endpoint
-			lastETag = strings.TrimSpace(resp.Header.Get("ETag"))
-			lastLastModified = strings.TrimSpace(resp.Header.Get("Last-Modified"))
-			cachedFeatures = features
-			if lastETag != "" || lastLastModified != "" {
-				debugf("Cached validators set (ETag=%q, Last-Modified=%q)", lastETag, lastLastModified)
-			}
-		}
-		return features, nil
+	// Usa apenas a nova API (inclui incêndios, acidentes e outras naturezas)
+	const u = "https://api-dev.fogos.pt/v2/incidents/active?all=1"
+	resp, err := doGet(u)
+	if err != nil {
+		return nil, err
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no endpoints tried")
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
-	return nil, lastErr
+	return toFeatures(data)
 }
 
 func toFeatures(body []byte) ([]Feature, error) {
-	// Try several shapes: FeatureCollection, {data: FeatureCollection}, array
+	// Constrói Features a partir de objetos simples (sem GeoJSON)
+	buildFromPlain := func(objs []map[string]any) []Feature {
+		out := make([]Feature, 0, len(objs))
+		for _, obj := range objs {
+			var geom map[string]any
+			// Tenta lat/lng ou latitude/longitude
+			if lat, ok1 := toFloat(obj["lat"]); ok1 {
+				if lng, ok2 := toFloat(obj["lng"]); ok2 {
+					geom = map[string]any{
+						"type":        "Point",
+						"coordinates": []any{lng, lat}, // GeoJSON [lon, lat]
+					}
+				}
+			} else if lat, ok1 := toFloat(obj["latitude"]); ok1 {
+				if lng, ok2 := toFloat(obj["longitude"]); ok2 {
+					geom = map[string]any{
+						"type":        "Point",
+						"coordinates": []any{lng, lat},
+					}
+				}
+			}
+			out = append(out, Feature{
+				Type:       "Feature",
+				Geometry:   geom,
+				Properties: obj,
+			})
+		}
+		return out
+	}
+
+	// 1) FeatureCollection (GeoJSON)
 	var fc FeatureCollection
 	if err := json.Unmarshal(body, &fc); err == nil && fc.Type != "" {
-		// Accept empty collections
 		return fc.Features, nil
 	}
+
+	// 2) Resposta embrulhada: { success?: bool, data: ... } (api-dev)
 	var wrap ApiResponse
 	if err := json.Unmarshal(body, &wrap); err == nil && wrap.Data != nil {
 		b, _ := json.Marshal(wrap.Data)
+		// 2a) data é FeatureCollection
 		if err := json.Unmarshal(b, &fc); err == nil && fc.Type != "" {
 			return fc.Features, nil
 		}
-		var arr []Feature
-		if err := json.Unmarshal(b, &arr); err == nil {
-			return arr, nil
+		// 2b) data é []Feature
+		var arrF []Feature
+		if err := json.Unmarshal(b, &arrF); err == nil {
+			// Verificar se os elementos parecem válidos (possuem propriedades/geometry/type)
+			valid := false
+			for _, f := range arrF {
+				if f.Type != "" || f.Geometry != nil || len(f.Properties) > 0 {
+					valid = true
+					break
+				}
+			}
+			if valid {
+				return arrF, nil
+			}
+			// Caso contrário, continuar para 2c (objetos simples)
+		}
+		// 2c) data é []map[string]any (objetos simples)
+		var arrM []map[string]any
+		if err := json.Unmarshal(b, &arrM); err == nil {
+			return buildFromPlain(arrM), nil
 		}
 	}
+
+	// 3) Top-level []Feature
 	var arr []Feature
 	if err := json.Unmarshal(body, &arr); err == nil {
 		return arr, nil
 	}
+
+	// 4) Top-level []map[string]any (objetos simples)
+	var arrM []map[string]any
+	if err := json.Unmarshal(body, &arrM); err == nil {
+		return buildFromPlain(arrM), nil
+	}
+
 	return nil, fmt.Errorf("unknown response shape")
 }
 
@@ -341,8 +328,14 @@ type perMuniState map[string]map[string]struct{}
 type perMuniSeen map[string]map[string]time.Time
 
 // Additional state: status per ID and first/concluded timestamps (UTC)
-type idStatusMap map[string]string
-type idTimeMap map[string]time.Time
+
+// Novo: snapshot tipado dos meios
+type Means struct {
+	Man     int `json:"man"`
+	Terrain int `json:"terrain"`
+	Aerial  int `json:"aerial"`
+	Aquatic int `json:"aquatic"`
+}
 
 func loadLastState(path string) (perMuniState, perMuniSeen, error) {
 	b, err := os.ReadFile(path)
@@ -411,12 +404,58 @@ func loadLastState(path string) (perMuniState, perMuniSeen, error) {
 			}
 		}
 	}
+
+	// Novo: carregar snapshots de meios
+	if m, ok := raw["means"].(map[string]any); ok {
+		for id, v := range m {
+			if mv, ok := v.(map[string]any); ok {
+				getInt := func(k string) int {
+					if f, ok := toFloat(mv[k]); ok {
+						return int(f)
+					}
+					return 0
+				}
+				lastMeansByID[id] = Means{
+					Man:     getInt("man"),
+					Terrain: getInt("terrain"),
+					Aerial:  getInt("aerial"),
+					Aquatic: getInt("aquatic"),
+				}
+			}
+		}
+	}
+	// Novo: carregar extra por ID
+	if m, ok := raw["extra_text"].(map[string]any); ok {
+		for id, v := range m {
+			if s, ok := v.(string); ok {
+				lastExtraByID[id] = s
+			}
+		}
+	}
+	// Novo: carregar marcas de sumários
+	if s, ok := raw["last_hourly"].(string); ok {
+		lastHourlyMark = s
+	}
+	if s, ok := raw["last_daily"].(string); ok {
+		lastSummaryDay = s
+	}
 	// Optional migration: legacy files may not have these keys; that's fine
 	return st, seen, nil
 }
 
 func saveLastState(path string, st perMuniState, seen perMuniSeen) error {
-	raw := map[string]any{"by": map[string][]string{}, "seen": map[string]map[string]string{}, "status": map[string]string{}, "first": map[string]string{}, "concluded": map[string]string{}}
+	raw := map[string]any{
+		"by":        map[string][]string{},
+		"seen":      map[string]map[string]string{},
+		"status":    map[string]string{},
+		"first":     map[string]string{},
+		"concluded": map[string]string{},
+		// Novo: persistir meios/extra e marcas de sumários
+		"means":       map[string]map[string]int{},
+		"extra_text":  map[string]string{},
+		"last_hourly": lastHourlyMark,
+		"last_daily":  lastSummaryDay,
+	}
 	for muni, set := range st {
 		ids := make([]string, 0, len(set))
 		for id := range set {
@@ -432,7 +471,7 @@ func saveLastState(path string, st perMuniState, seen perMuniSeen) error {
 		}
 		seenOut[muni] = out
 	}
-	// Save extended maps
+	// Save extended maps (já existente)
 	stOut := raw["status"].(map[string]string)
 	for id, s := range lastStatusByID {
 		if strings.TrimSpace(id) != "" && strings.TrimSpace(s) != "" {
@@ -447,6 +486,22 @@ func saveLastState(path string, st perMuniState, seen perMuniSeen) error {
 	for id, ts := range concludedAtID {
 		cOut[id] = ts.UTC().Format(time.RFC3339)
 	}
+	// Novo: persistir meios
+	meansOut := raw["means"].(map[string]map[string]int)
+	for id, m := range lastMeansByID {
+		meansOut[id] = map[string]int{
+			"man":     m.Man,
+			"terrain": m.Terrain,
+			"aerial":  m.Aerial,
+			"aquatic": m.Aquatic,
+		}
+	}
+	// Novo: persistir extra
+	extraOut := raw["extra_text"].(map[string]string)
+	for id, s := range lastExtraByID {
+		extraOut[id] = s
+	}
+
 	b, _ := json.MarshalIndent(raw, "", "  ")
 	if err := os.WriteFile(path, b, 0644); err != nil {
 		return err
@@ -461,9 +516,25 @@ func filterByMunicipios(features []Feature, wantedFlat []string) []Feature {
 	}
 	out := make([]Feature, 0, len(features))
 	for _, f := range features {
-		mun := normMunicipio(getMunicipio(f.Properties))
+		raw := getMunicipio(f.Properties)
+		mun := normMunicipio(raw)
 		if _, ok := wset[mun]; ok {
 			out = append(out, f)
+			continue
+		}
+		// Debug: explain why it was skipped
+		if getenv("DEBUG", "") != "" || strings.EqualFold(getenv("LOG_LEVEL", ""), "debug") {
+			// collect property keys for quick inspection when municipality is missing
+			keys := make([]string, 0, len(f.Properties))
+			for k := range f.Properties {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			if strings.TrimSpace(raw) == "" {
+				debugf("skip: no concelho/municipio field; props keys=%v", keys)
+			} else {
+				debugf("skip: concelho %q (norm=%q) not in wanted=%v; props keys=%v", raw, mun, wantedFlat, keys)
+			}
 		}
 	}
 	return out
@@ -571,6 +642,10 @@ func getCoords(geom map[string]any) (lat, lon float64, ok bool) {
 
 func mapsURLForFeature(f Feature, muni string) string {
 	if lat, lon, ok := getCoords(f.Geometry); ok {
+		// Preferir geo: no Android, se ativado
+		if getenv("NTFY_CLICK_GEO", "") != "" {
+			return fmt.Sprintf("geo:0,0?q=%f,%f", lat, lon)
+		}
 		return fmt.Sprintf("https://www.google.com/maps/search/?api=1&query=%f,%f", lat, lon)
 	}
 	if strings.TrimSpace(muni) != "" {
@@ -627,6 +702,18 @@ func addTag(tags, t string) string {
 		}
 	}
 	return tags + "," + t
+}
+
+// Novo: adicionar várias tags de uma vez (CSV)
+func addTagsCSV(base, addCSV string) string {
+	addCSV = strings.TrimSpace(addCSV)
+	if addCSV == "" {
+		return base
+	}
+	for _, t := range strings.Split(addCSV, ",") {
+		base = addTag(base, strings.TrimSpace(t))
+	}
+	return base
 }
 
 func getPropStr(p map[string]any, keys ...string) string {
@@ -726,14 +813,142 @@ func postNtfyExt(ntfyURL, topic, title, body, tags, priority, clickURL string) {
 	}
 	// Quiet hours: lower priority and tag
 	if inQuietHours() {
-		if strings.TrimSpace(priority) == "" || priority > "3" {
+		// reduzir para prioridade default (3) se vier maior
+		if strings.TrimSpace(priority) == "" {
+			priority = "3"
+		} else if v, err := strconv.Atoi(priority); err == nil && v > 3 {
 			priority = "3"
 		}
 		tags = addTag(tags, "zzz")
 	}
+
+	// Common: derive actions and optional attach URL from body/click
+	// Header-mode requires URL sanitization for commas/semicolons
+	sanitizeActionURL := func(u string) string {
+		if u == "" {
+			return u
+		}
+		u = strings.ReplaceAll(u, ",", "%2C")
+		u = strings.ReplaceAll(u, ";", "%3B")
+		return u
+	}
+	// Build actions for both header- and JSON-mode
+	actionsHeader := []string{}
+	var actionsJSON []map[string]any
+	addAction := func(label, u string) {
+		if strings.TrimSpace(u) == "" {
+			return
+		}
+		// Header
+		actionsHeader = append(actionsHeader, fmt.Sprintf("view, %s, %s", label, sanitizeActionURL(u)))
+		// JSON
+		actionsJSON = append(actionsJSON, map[string]any{
+			"action": "view",
+			"label":  label,
+			"url":    u,
+			"clear":  true,
+		})
+	}
+	if clickURL != "" {
+		addAction("Abrir Mapa", clickURL)
+	}
+	if urlFogos := extractFogosURLFromBody(body); urlFogos != "" {
+		addAction("Abrir Fogos", urlFogos)
+	}
+	var attachAreaURL string
+	if v := extractURLAfterPrefix(body, "Área URL: "); v != "" {
+		addAction("Abrir área", v)
+		attachAreaURL = v
+	} else if v2 := extractURLAfterPrefix(body, "Area URL: "); v2 != "" { // fallback sem acento
+		addAction("Abrir area", v2)
+		attachAreaURL = v2
+	}
+
+	useJSON := getenv("NTFY_JSON", "") != ""
+	// Normalize tags to slice for JSON mode
+	splitTags := func(csv string) []string {
+		if strings.TrimSpace(csv) == "" {
+			return nil
+		}
+		seen := map[string]struct{}{}
+		out := []string{}
+		for _, t := range strings.Split(csv, ",") {
+			tt := strings.TrimSpace(t)
+			if tt == "" {
+				continue
+			}
+			if _, ok := seen[tt]; ok {
+				continue
+			}
+			seen[tt] = struct{}{}
+			out = append(out, tt)
+		}
+		return out
+	}
+	// Priority number for JSON mode
+	prNum := 3
+	if p := strings.TrimSpace(priority); p != "" {
+		if v, err := strconv.Atoi(p); err == nil {
+			prNum = v
+		}
+	}
+
+	if useJSON {
+		// JSON publishing: POST to root with topic in body
+		endpoint := strings.TrimRight(ntfyURL, "/") + "/"
+		payload := map[string]any{
+			"topic":    topic,
+			"message":  body,
+			"title":    title,
+			"priority": prNum,
+		}
+		if clickURL != "" {
+			payload["click"] = clickURL
+		}
+		if tg := splitTags(tags); len(tg) > 0 {
+			payload["tags"] = tg
+		}
+		if getenv("NTFY_MARKDOWN", "") != "" {
+			payload["markdown"] = true
+		}
+		if icon := getenv("NTFY_ICON_URL", ""); icon != "" {
+			payload["icon"] = icon
+		}
+		if email := getenv("NTFY_EMAIL", ""); email != "" {
+			payload["email"] = email
+		}
+		if getenv("NTFY_ATTACH_AREA", "") != "" && attachAreaURL != "" {
+			payload["attach"] = attachAreaURL
+		}
+		if len(actionsJSON) > 0 && getenv("NTFY_ACTIONS", "1") != "0" {
+			payload["actions"] = actionsJSON
+		}
+		b, _ := json.Marshal(payload)
+		req, _ := http.NewRequest("POST", endpoint, bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ntfy erro:", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			fmt.Fprintf(os.Stderr, "ntfy HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(msg)))
+		}
+		return
+	}
+
+	// Default: header-based publishing (existing behavior)
 	endpoint := strings.TrimRight(ntfyURL, "/") + "/" + topic
+	// Markdown opcional
+	useMarkdown := getenv("NTFY_MARKDOWN", "")
+	ct := "text/plain; charset=utf-8"
+	if useMarkdown != "" {
+		ct = "text/markdown; charset=utf-8"
+	}
 	req, _ := http.NewRequest("POST", endpoint, bytes.NewBufferString(body))
-	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
+	req.Header.Set("Content-Type", ct)
 	req.Header.Set("Title", title)
 	if tags != "" {
 		req.Header.Set("Tags", tags)
@@ -746,24 +961,27 @@ func postNtfyExt(ntfyURL, topic, title, body, tags, priority, clickURL string) {
 	if strings.TrimSpace(clickURL) != "" {
 		req.Header.Set("Click", clickURL)
 	}
-	// Optional Actions: 'Abrir Mapa' and 'Abrir Fogos'
-	actions := []string{}
-	if clickURL != "" {
-		actions = append(actions, fmt.Sprintf("view, Abrir Mapa, %s", clickURL))
+	// Headers extra suportados pelo ntfy (via env)
+	if useMarkdown != "" {
+		req.Header.Set("Markdown", "yes")
 	}
-	if fogosID := getenv("FOGOS_ID_OVERRIDE", ""); false { // placeholder to keep structure
-		_ = fogosID
+	if icon := getenv("NTFY_ICON_URL", ""); icon != "" {
+		req.Header.Set("Icon", icon)
 	}
-	if urlFogos := extractFogosURLFromBody(body); urlFogos != "" {
-		actions = append(actions, fmt.Sprintf("view, Abrir Fogos, %s", urlFogos))
+	if email := getenv("NTFY_EMAIL", ""); email != "" {
+		req.Header.Set("Email", email)
 	}
-	if areaURL := extractURLAfterPrefix(body, "Área URL: "); areaURL != "" {
-		actions = append(actions, fmt.Sprintf("view, Abrir área, %s", areaURL))
-	} else if areaURL2 := extractURLAfterPrefix(body, "Area URL: "); areaURL2 != "" { // no accent fallback
-		actions = append(actions, fmt.Sprintf("view, Abrir area, %s", areaURL2))
+	if cacheCtl := getenv("NTFY_CACHE", ""); cacheCtl != "" {
+		req.Header.Set("Cache", cacheCtl) // e.g., "no"
 	}
-	if len(actions) > 0 {
-		req.Header.Set("Actions", strings.Join(actions, "; "))
+	if fb := getenv("NTFY_FIREBASE", ""); fb != "" {
+		req.Header.Set("Firebase", fb) // e.g., "no"
+	}
+	if getenv("NTFY_ATTACH_AREA", "") != "" && attachAreaURL != "" {
+		req.Header.Set("Attach", attachAreaURL)
+	}
+	if len(actionsHeader) > 0 && getenv("NTFY_ACTIONS", "1") != "0" {
+		req.Header.Set("Actions", strings.Join(actionsHeader, "; "))
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -884,13 +1102,47 @@ func shouldKeepByNatureAndStatus(p map[string]any) bool {
 	// EXCLUDE_STATUS_CODES = comma-int list
 	if exc := parseIntSetFromEnv("EXCLUDE_STATUS_CODES"); len(exc) > 0 {
 		if scF, ok := toFloat(p["statusCode"]); ok {
-			sc := int(scF)
-			if _, bad := exc[sc]; bad {
+			if _, bad := exc[int(scF)]; bad {
 				return false
 			}
 		}
 	}
-	// INCLUDE_NATUREZA = case-insensitive list; match on natureza or naturezaCode
+	// Extras: include/exclude por naturezaCode (ex.: 3101)
+	if incCodes := parseStrSetFromEnv("INCLUDE_NATUREZA_CODE"); len(incCodes) > 0 {
+		code := strings.ToLower(stripAccents(getPropStr(p, "naturezaCode")))
+		if _, ok := incCodes[code]; !ok {
+			return false
+		}
+	}
+	if excCodes := parseStrSetFromEnv("EXCLUDE_NATUREZA_CODE"); len(excCodes) > 0 {
+		code := strings.ToLower(stripAccents(getPropStr(p, "naturezaCode")))
+		if _, ok := excCodes[code]; ok {
+			return false
+		}
+	}
+	// INCLUDE_STATUS / EXCLUDE_STATUS (por nome; substring)
+	if incS := parseStrSetFromEnv("INCLUDE_STATUS"); len(incS) > 0 {
+		cur := strings.ToLower(stripAccents(getPropStr(p, "status")))
+		ok := false
+		for want := range incS {
+			if want == "" || strings.Contains(cur, want) || cur == want {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	if excS := parseStrSetFromEnv("EXCLUDE_STATUS"); len(excS) > 0 {
+		cur := strings.ToLower(stripAccents(getPropStr(p, "status")))
+		for bad := range excS {
+			if bad != "" && (strings.Contains(cur, bad) || cur == bad) {
+				return false
+			}
+		}
+	}
+	// INCLUDE_NATUREZA (por nome; já existia)
 	if inc := parseStrSetFromEnv("INCLUDE_NATUREZA"); len(inc) > 0 {
 		nz := strings.ToLower(stripAccents(getPropStr(p, "natureza")))
 		nzc := strings.ToLower(stripAccents(getPropStr(p, "naturezaCode")))
@@ -900,7 +1152,6 @@ func shouldKeepByNatureAndStatus(p map[string]any) bool {
 		if _, ok := inc[nzc]; ok {
 			return true
 		}
-		// allow substring match
 		for want := range inc {
 			if want != "" && strings.Contains(nz, want) {
 				return true
@@ -923,6 +1174,9 @@ func enrichMeansTagsAndPriority(p map[string]any, baseTags, basePriority string)
 	ter := get("terrain")
 	air := get("aerial")
 	aq := get("meios_aquaticos")
+	hf := get("heliFight")
+	hc := get("heliCoord")
+	pf := get("planeFight")
 	// thresholds (0 disables)
 	thMan, _ := strconv.Atoi(getenv("MIN_MAN", "0"))
 	thTer, _ := strconv.Atoi(getenv("MIN_TERRAIN", "0"))
@@ -930,36 +1184,51 @@ func enrichMeansTagsAndPriority(p map[string]any, baseTags, basePriority string)
 	thAq, _ := strconv.Atoi(getenv("MIN_AQUATIC", "0"))
 	tags := baseTags
 	prio := basePriority
-	// lower numbers are higher priority in ntfy (1 max, 5 min)
-	bump := func(n int) {
+	// ntfy: 5 = máx/urgente, 3 = default, 1 = min → elevar prioridade quando n > cur
+	inc := func(n int) {
 		if n <= 0 {
 			return
 		}
-		cur, _ := strconv.Atoi(func() string {
-			if strings.TrimSpace(prio) == "" {
-				return "5"
+		cur := 3
+		if strings.TrimSpace(prio) != "" {
+			if v, err := strconv.Atoi(prio); err == nil {
+				cur = v
 			}
-			return prio
-		}())
-		if n < cur {
+		}
+		if n > cur {
 			prio = strconv.Itoa(n)
 		}
 	}
+	// Melhor mapeamento de emojis
 	if thMan > 0 && man >= thMan {
-		tags = addTag(tags, "man")
-		bump(2)
+		tags = addTag(tags, "busts_in_silhouette")
+		inc(4)
 	}
 	if thTer > 0 && ter >= thTer {
-		tags = addTag(tags, "terrain")
-		bump(3)
+		tags = addTag(tags, "deciduous_tree")
+		inc(4)
 	}
 	if thAir > 0 && air >= thAir {
-		tags = addTag(tags, "aerial")
-		bump(2)
+		tags = addTag(tags, "small_airplane")
+		inc(5)
 	}
 	if thAq > 0 && aq >= thAq {
-		tags = addTag(tags, "aquatic")
-		bump(3)
+		tags = addTag(tags, "ocean")
+		inc(4)
+	}
+	// aeronaves dedicadas
+	if hf > 0 || hc > 0 {
+		tags = addTag(tags, "helicopter")
+		inc(5)
+	}
+	if pf > 0 {
+		tags = addTag(tags, "airplane")
+		inc(5)
+	}
+	// importante
+	if imp := strings.ToLower(strings.TrimSpace(getPropStr(p, "important"))); imp == "true" || imp == "1" {
+		tags = addTag(tags, "exclamation")
+		inc(5)
 	}
 	return tags, prio
 }
@@ -1055,11 +1324,20 @@ func saveKMLAndCompute(kmlStr, saveDir, id string) (areaKm2, perimeterKm float64
 
 // In-memory status tracking for transitions and summaries
 var (
-	lastStatusByID  = map[string]string{}
-	firstSeenByID   = map[string]time.Time{}
-	concludedAtID   = map[string]time.Time{}
-	lastSummaryHour int
-	lastSummaryDay  string
+	lastStatusByID = map[string]string{}
+	firstSeenByID  = map[string]time.Time{}
+	concludedAtID  = map[string]time.Time{}
+
+	// Removido: lastSummaryHour (causava repetição quando re-inicializado)
+	// lastSummaryHour int
+	lastSummaryDay string
+
+	// Novo: marca do último sumário horário enviado ("YYYY-MM-DD HH"), persistente
+	lastHourlyMark string
+
+	// Novo: último snapshot de meios/extra por ID, persistente
+	lastMeansByID = map[string]Means{}
+	lastExtraByID = map[string]string{}
 )
 
 func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
@@ -1131,7 +1409,7 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 		}
 	}
 
-	// update last-seen for current active IDs and collect events for new ones and status changes
+	// update last-seen for current active IDs e recolher eventos
 	type newEvent struct {
 		muniKey string
 		disp    string
@@ -1143,55 +1421,132 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	}
 	events := make([]newEvent, 0, 8)
 	statusEvents := make([]newEvent, 0, 8)
+
+	// Novo: eventos de atualização de meios e extra
+	type meansEvent struct {
+		muniKey string
+		disp    string
+		id      string
+		old     Means
+		new     Means
+		f       Feature
+	}
+	type extraEvent struct {
+		muniKey string
+		disp    string
+		id      string
+		old     string
+		new     string
+		f       Feature
+	}
+	meansEvents := make([]meansEvent, 0, 8)
+	extraEvents := make([]extraEvent, 0, 8)
+
 	for muniKey, feats := range perMuniNew {
 		for _, f := range feats {
 			id := getID(f.Properties)
 			if id == "" {
+				if getenv("DEBUG", "") != "" || strings.EqualFold(getenv("LOG_LEVEL", ""), "debug") {
+					debugf("skip: feature without ID in muniKey=%s; props keys=%v", muniKey, func() []string {
+						ks := make([]string, 0, len(f.Properties))
+						for k := range f.Properties {
+							ks = append(ks, k)
+						}
+						sort.Strings(ks)
+						return ks
+					}())
+				}
 				continue
 			}
-			// mark last seen for ids present in this cycle
+			// mark last seen
 			if seen[muniKey] == nil {
 				seen[muniKey] = map[string]time.Time{}
 			}
 			seen[muniKey][id] = now
-			if _, ok := st[muniKey][id]; !ok {
+
+			// Novo: ler meios atuais
+			getInt := func(name string) int {
+				if v, ok := toFloat(f.Properties[name]); ok {
+					return int(v)
+				}
+				return 0
+			}
+			curMeans := Means{
+				Man:     getInt("man"),
+				Terrain: getInt("terrain"),
+				Aerial:  getInt("aerial"),
+				Aquatic: getInt("meios_aquaticos"),
+			}
+			curExtra := getPropStr(f.Properties, "extra")
+
+			// new incident
+			_, existed := st[muniKey][id]
+			if !existed {
 				st[muniKey][id] = struct{}{}
 				when := prettyTime(f.Properties["dateTime"])
 				disp := getMunicipio(f.Properties)
 				if disp == "" {
 					disp = muniKey
 				}
+				if getenv("DEBUG", "") != "" || strings.EqualFold(getenv("LOG_LEVEL", ""), "debug") {
+					debugf("new: muniKey=%s id=%s disp=%s", muniKey, id, disp)
+				}
 				events = append(events, newEvent{muniKey: muniKey, disp: disp, id: id, when: when, f: f})
-				// first seen tracking
 				if _, ok := firstSeenByID[id]; !ok {
 					firstSeenByID[id] = now
 				}
+			} else {
+				// Novo: detetar alterações de meios e extra (só após já existir)
+				if prev, ok := lastMeansByID[id]; ok {
+					if prev != curMeans {
+						meansEvents = append(meansEvents, meansEvent{
+							muniKey: muniKey, disp: getMunicipio(f.Properties), id: id,
+							old: prev, new: curMeans, f: f,
+						})
+					}
+				}
+				if prevX, ok := lastExtraByID[id]; ok {
+					if strings.TrimSpace(prevX) != strings.TrimSpace(curExtra) {
+						extraEvents = append(extraEvents, extraEvent{
+							muniKey: muniKey, disp: getMunicipio(f.Properties), id: id,
+							old: prevX, new: curExtra, f: f,
+						})
+					}
+				}
 			}
-			// Status change detection
+			// Atualizar snapshots sempre no fim
+			lastMeansByID[id] = curMeans
+			lastExtraByID[id] = curExtra
+
+			// Status change detection — forçar envio na primeira vez que o vemos
 			curStatus := getPropStr(f.Properties, "status")
 			prev := lastStatusByID[id]
-			if curStatus != "" && curStatus != prev {
-				statusEvents = append(statusEvents, newEvent{muniKey: muniKey, disp: getMunicipio(f.Properties), id: id, when: prettyTime(f.Properties["updated"]), f: f, prev: prev, cur: curStatus})
-				if prev != "" {
+			forceFirstSeenStatus := !existed
+			if curStatus != "" && (curStatus != prev || forceFirstSeenStatus) {
+				statusEvents = append(statusEvents, newEvent{
+					muniKey: muniKey,
+					disp:    getMunicipio(f.Properties),
+					id:      id,
+					when:    prettyTime(f.Properties["updated"]),
+					f:       f,
+					prev:    prev,
+					cur:     curStatus,
+				})
+				if prev != "" && curStatus != prev {
 					statusTransitions.WithLabelValues(prev, curStatus).Inc()
 				}
 				lastStatusByID[id] = curStatus
-				// conclusion timing
 				if strings.EqualFold(curStatus, "Conclusão") || strings.Contains(strings.ToLower(stripAccents(curStatus)), "conclus") {
 					concludedAtID[id] = now
 					if t0, ok := firstSeenByID[id]; ok && now.After(t0) {
 						timeToConclusion.Observe(now.Sub(t0).Seconds())
 					}
 				}
-				// Reactivation: previously concluded now active again
-				if (strings.Contains(strings.ToLower(stripAccents(prev)), "conclus") || strings.Contains(strings.ToLower(stripAccents(prev)), "vigil")) && (strings.Contains(strings.ToLower(stripAccents(curStatus)), "curso") || strings.Contains(strings.ToLower(stripAccents(curStatus)), "despacho")) {
-					// mark with special tag later via event fields
-				}
 			}
 		}
 	}
 
-	anyChange := len(events) > 0 || len(statusEvents) > 0
+	anyChange := len(events) > 0 || len(statusEvents) > 0 || len(meansEvents) > 0 || len(extraEvents) > 0
 
 	// notify (aggregate or per-incident)
 	if anyChange {
@@ -1219,6 +1574,42 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 			title := fmt.Sprintf("Novos incidentes (%d)", len(events))
 			body := strings.Join(lines, "\n") + fmt.Sprintf("\nTotal ativo no alvo: %d", len(filtered))
 			postNtfyExt(ntfyURL, topic, title, body, tags, priority, "")
+
+			// NEW: não perder transições de estado na agregação
+			for _, ev := range statusEvents {
+				p := ev.f.Properties
+				curStatus := getPropStr(p, "status")
+				prev := ev.prev
+				title := fmt.Sprintf("%s → %s — %s", func() string {
+					if strings.TrimSpace(prev) == "" {
+						return "Novo"
+					}
+					return prev
+				}(), curStatus, ev.disp)
+				man := getPropStr(p, "man")
+				ter := getPropStr(p, "terrain")
+				air := getPropStr(p, "aerial")
+				aq := getPropStr(p, "meios_aquaticos")
+				body := fmt.Sprintf("ID: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, man, ter, air, aq)
+				infoTags, extraLines := extraInfoTags(p)
+				if len(extraLines) > 0 {
+					body += "\n" + strings.Join(extraLines, "\n")
+				}
+				pr := priority
+				s := strings.ToLower(stripAccents(curStatus))
+				if strings.Contains(s, "em curso") || strings.Contains(s, "em resolucao") {
+					pr = "5"
+				} else if strings.Contains(s, "despacho") {
+					pr = "4"
+				} else if strings.Contains(s, "vigilancia") || strings.Contains(s, "conclus") {
+					pr = "3"
+				}
+				tg, pr2 := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), pr)
+				if strings.Contains(s, "conclus") {
+					tg = addTag(tg, "white_check_mark")
+				}
+				postNtfyExt(ntfyURL, topic, title, body, tg, pr2, mapsURLForFeature(ev.f, ev.disp))
+			}
 		} else {
 			for _, ev := range events {
 				p := ev.f.Properties
@@ -1228,11 +1619,18 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				ter := getPropStr(p, "terrain")
 				air := getPropStr(p, "aerial")
 				aq := getPropStr(p, "meios_aquaticos")
+				hf := getPropStr(p, "heliFight")
+				hc := getPropStr(p, "heliCoord")
+				pf := getPropStr(p, "planeFight")
 				title := fmt.Sprintf("Novo em %s — %s", ev.disp, nature)
 				if ev.when != "" {
 					title += " (" + ev.when + ")"
 				}
 				body := fmt.Sprintf("ID: %s\nMunicípio: %s\nEstado: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, ev.disp, status, man, ter, air, aq)
+				// aeronaves (se presentes)
+				if hf != "0" || hc != "0" || pf != "0" {
+					body += fmt.Sprintf("\nAeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf)
+				}
 				// Extra
 				if extra := getPropStr(p, "extra"); extra != "" {
 					_, hi := parseExtraTags(extra)
@@ -1240,23 +1638,26 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 						body += "\nExtra: " + hi
 					}
 				}
-				// KML area
+				// Info adicional e tags
+				infoTags, extraLines := extraInfoTags(p)
+				if len(extraLines) > 0 {
+					body += "\n" + strings.Join(extraLines, "\n")
+				}
+				// KML área
 				if kml := getPropStr(p, "kmlVost", "kml"); kml != "" {
 					if areaKm2, perKm, areaURL, saved, _ := saveKMLAndCompute(kml, getenv("SAVE_KML_DIR", ""), ev.id); saved {
 						body += fmt.Sprintf("\nÁrea: %.2f km², Perímetro: %.1f km", areaKm2, perKm)
-						// Add area action by passing as clickURL? We'll prefer an action; we add URL in body so extractor can build action
 						body += "\nÁrea URL: " + areaURL
 					}
 				}
 				body += fmt.Sprintf("\nTotal ativo no alvo: %d", len(filtered))
 				clickURL := mapsURLForFeature(ev.f, ev.disp)
-				// Embed Fogos URL hint
 				if ev.id != "" {
 					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
 				}
-				// Enrich tags/priority based on means
-				tg, pr := enrichMeansTagsAndPriority(p, tags, priority)
-				// Extra tags from 'extra'
+				// Enriquecer tags/prioridade
+				tg, pr := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), priority)
+				// Extra tags do 'extra'
 				if extra := getPropStr(p, "extra"); extra != "" {
 					if more, _ := parseExtraTags(extra); len(more) > 0 {
 						for _, t := range more {
@@ -1281,7 +1682,13 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				ter := getPropStr(p, "terrain")
 				air := getPropStr(p, "aerial")
 				aq := getPropStr(p, "meios_aquaticos")
+				hf := getPropStr(p, "heliFight")
+				hc := getPropStr(p, "heliCoord")
+				pf := getPropStr(p, "planeFight")
 				body := fmt.Sprintf("ID: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, man, ter, air, aq)
+				if hf != "0" || hc != "0" || pf != "0" {
+					body += fmt.Sprintf("\nAeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf)
+				}
 				// Extra
 				if extra := getPropStr(p, "extra"); extra != "" {
 					_, hi := parseExtraTags(extra)
@@ -1289,27 +1696,31 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 						body += "\nExtra: " + hi
 					}
 				}
+				// Info adicional
+				infoTags, extraLines := extraInfoTags(p)
+				if len(extraLines) > 0 {
+					body += "\n" + strings.Join(extraLines, "\n")
+				}
 				// Fogos link
 				if ev.id != "" {
 					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
 				}
-				// Adjust priority based on status
+				// Ajuste de prioridade por status
 				pr := priority
 				s := strings.ToLower(stripAccents(curStatus))
-				if strings.Contains(s, "despacho") {
-					pr = "4" // aviso inicial, menor prioridade
-				} else if strings.Contains(s, "em curso") || strings.Contains(s, "em resolucao") {
-					pr = "2" // ativo, prioridade alta
+				if strings.Contains(s, "em curso") || strings.Contains(s, "em resolucao") {
+					pr = "5"
+				} else if strings.Contains(s, "despacho") {
+					pr = "4"
 				} else if strings.Contains(s, "vigilancia") || strings.Contains(s, "conclus") {
 					pr = "3"
 				}
-				tg, pr2 := enrichMeansTagsAndPriority(p, tags, pr)
-				// Reactivation or conclusion tags
+				tg, pr2 := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), pr)
 				prevS := strings.ToLower(stripAccents(prev))
 				if (strings.Contains(prevS, "conclus") || strings.Contains(prevS, "vigil")) && (strings.Contains(s, "curso") || strings.Contains(s, "despacho")) {
 					tg = addTag(tg, "repeat")
 					title = "Reativado: " + title
-					pr2 = "2"
+					pr2 = "5"
 				}
 				if strings.Contains(s, "conclus") {
 					tg = addTag(tg, "white_check_mark")
@@ -1323,6 +1734,62 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 					}
 				}
 				postNtfyExt(ntfyURL, topic, title, body, tg, pr2, mapsURLForFeature(ev.f, ev.disp))
+			}
+
+			// Novo: enviar atualizações de meios
+			if getenv("NOTIFY_MEANS_CHANGES", "1") != "0" {
+				for _, ev := range meansEvents {
+					parts := []string{}
+					if ev.old.Man != ev.new.Man {
+						parts = append(parts, fmt.Sprintf("man: %d → %d", ev.old.Man, ev.new.Man))
+					}
+					if ev.old.Terrain != ev.new.Terrain {
+						parts = append(parts, fmt.Sprintf("ter: %d → %d", ev.old.Terrain, ev.new.Terrain))
+					}
+					if ev.old.Aerial != ev.new.Aerial {
+						parts = append(parts, fmt.Sprintf("air: %d → %d", ev.old.Aerial, ev.new.Aerial))
+					}
+					if ev.old.Aquatic != ev.new.Aquatic {
+						parts = append(parts, fmt.Sprintf("aq: %d → %d", ev.old.Aquatic, ev.new.Aquatic))
+					}
+					// incluir aeronaves se existirem nos props atuais
+					p := ev.f.Properties
+					hf := getPropStr(p, "heliFight")
+					hc := getPropStr(p, "heliCoord")
+					pf := getPropStr(p, "planeFight")
+					if hf != "0" || hc != "0" || pf != "0" {
+						parts = append(parts, fmt.Sprintf("aeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf))
+					}
+					if len(parts) == 0 {
+						continue
+					}
+					title := fmt.Sprintf("Atualização de meios — %s", ev.disp)
+					body := fmt.Sprintf("ID: %s\n%s", ev.id, strings.Join(parts, ", "))
+					infoTags, extraLines := extraInfoTags(p)
+					if len(extraLines) > 0 {
+						body += "\n" + strings.Join(extraLines, "\n")
+					}
+					tg, pr := enrichMeansTagsAndPriority(p, addTag(tags, infoTags), "3")
+					postNtfyExt(ntfyURL, topic, title, body, tg, pr, mapsURLForFeature(ev.f, ev.disp))
+				}
+			}
+			// Novo: enviar alterações no extra
+			if getenv("NOTIFY_EXTRA_CHANGES", "1") != "0" {
+				for _, ev := range extraEvents {
+					// ignorar se ambos vazios
+					if strings.TrimSpace(ev.old) == strings.TrimSpace(ev.new) {
+						continue
+					}
+					title := fmt.Sprintf("Atualização — %s", ev.disp)
+					body := fmt.Sprintf("ID: %s\nExtra: %s", ev.id, strings.TrimSpace(ev.new))
+					// tags adicionais do 'extra' (ex.: estrada cortada)
+					more, _ := parseExtraTags(ev.new)
+					tg := tags
+					for _, t := range more {
+						tg = addTag(tg, t)
+					}
+					postNtfyExt(ntfyURL, topic, title, body, tg, "3", mapsURLForFeature(ev.f, ev.disp))
+				}
 			}
 		}
 	}
@@ -1346,7 +1813,6 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 
 	// Metrics gauges: reset then set counts for current filtered
 	if getenv("METRICS_DISABLE", "") == "" {
-		metricsEnabled = true
 		activeIncidents.Reset()
 		for _, f := range filtered {
 			p := f.Properties
@@ -1363,46 +1829,53 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	// Periodic summary (hourly/daily)
 	nowHour := now.Hour()
 	nowDay := now.Format("2006-01-02")
-	if getenv("SUMMARY_HOURLY", "1") != "0" && lastSummaryHour != nowHour {
-		// Build summary by concelho, natureza, estado
-		byConc := map[string]int{}
-		byNat := map[string]int{}
-		bySta := map[string]int{}
-		for _, f := range filtered {
-			p := f.Properties
-			byConc[getPropStr(p, "concelho")]++
-			byNat[getPropStr(p, "natureza")]++
-			bySta[getPropStr(p, "status")]++
-		}
-		mk := func(m map[string]int) string {
-			type kv struct {
-				k string
-				v int
+	nowMin := now.Minute()
+
+	// Corrigido: só no minuto 0 e uma vez por hora, persistente
+	if getenv("SUMMARY_HOURLY", "1") != "0" {
+		hourMark := now.Format("2006-01-02 15")
+		if nowMin == 0 && lastHourlyMark != hourMark {
+			// Build summary by concelho, natureza, estado
+			byConc := map[string]int{}
+			byNat := map[string]int{}
+			bySta := map[string]int{}
+			for _, f := range filtered {
+				p := f.Properties
+				byConc[getPropStr(p, "concelho")]++
+				byNat[getPropStr(p, "natureza")]++
+				bySta[getPropStr(p, "status")]++
 			}
-			arr := []kv{}
-			for k, v := range m {
-				arr = append(arr, kv{k, v})
-			}
-			sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
-			parts := []string{}
-			for i, e := range arr {
-				if i >= 6 {
-					break
+			mk := func(m map[string]int) string {
+				type kv struct {
+					k string
+					v int
 				}
-				parts = append(parts, fmt.Sprintf("%s: %d", e.k, e.v))
+				arr := []kv{}
+				for k, v := range m {
+					arr = append(arr, kv{k, v})
+				}
+				sort.Slice(arr, func(i, j int) bool { return arr[i].v > arr[j].v })
+				parts := []string{}
+				for i, e := range arr {
+					if i >= 6 {
+						break
+					}
+					parts = append(parts, fmt.Sprintf("%s: %d", e.k, e.v))
+				}
+				if len(parts) == 0 {
+					return "(n/a)"
+				}
+				return strings.Join(parts, ", ")
 			}
-			if len(parts) == 0 {
-				return "(n/a)"
-			}
-			return strings.Join(parts, ", ")
+			title := fmt.Sprintf("Sumário horário (%02d:00)", nowHour)
+			body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
+			postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "bar_chart"), "3", "")
+			lastHourlyMark = hourMark
 		}
-		title := fmt.Sprintf("Sumário horário (%02d:00)", nowHour)
-		body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
-		postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "bar_chart"), "3", "")
-		lastSummaryHour = nowHour
 	}
-	if getenv("SUMMARY_DAILY", "1") != "0" && lastSummaryDay != nowDay && now.Hour() == 8 {
-		// Daily at ~08:00
+
+	// Corrigido: diário apenas às 08:00 em ponto e uma vez por dia
+	if getenv("SUMMARY_DAILY", "1") != "0" && lastSummaryDay != nowDay && nowHour == 8 && nowMin == 0 {
 		byConc := map[string]int{}
 		byNat := map[string]int{}
 		bySta := map[string]int{}
@@ -1508,4 +1981,81 @@ func main() {
 			return
 		}
 	}
+}
+
+// Helpers para enriquecimento de notificações
+func relUpdated(p map[string]any) string {
+	// "updated": {"sec": ...}
+	if m, ok := p["updated"].(map[string]any); ok && m != nil {
+		if sec, ok2 := toFloat(m["sec"]); ok2 && sec > 0 {
+			t := time.Unix(int64(sec), 0)
+			d := time.Since(t)
+			if d < 0 {
+				d = -d
+			}
+			if d < time.Minute {
+				return "agora"
+			}
+			return fmt.Sprintf("há %dm", int(d.Minutes()))
+		}
+	}
+	return ""
+}
+
+func extraInfoTags(p map[string]any) (addTags string, extraLines []string) {
+	// Linhas informativas
+	if s := getPropStr(p, "localidade"); s != "" {
+		extraLines = append(extraLines, "Localidade: "+s)
+	}
+	if s := getPropStr(p, "detailLocation"); s != "" {
+		extraLines = append(extraLines, "Detalhe: "+s)
+	}
+	if s := getPropStr(p, "freguesia"); s != "" {
+		extraLines = append(extraLines, "Freguesia: "+s)
+	}
+	if s := getPropStr(p, "dico"); s != "" {
+		extraLines = append(extraLines, "DICO: "+s)
+	}
+	if rg := getPropStr(p, "regiao"); rg != "" || getPropStr(p, "sub_regiao") != "" {
+		extraLines = append(extraLines, fmt.Sprintf("Região: %s / %s", rg, getPropStr(p, "sub_regiao")))
+	}
+	if ru := relUpdated(p); ru != "" {
+		extraLines = append(extraLines, "Atualizado: "+ru)
+	}
+
+	// ICNF
+	if m, ok := p["icnf"].(map[string]any); ok && m != nil {
+		if f, ok2 := toFloat(m["altitude"]); ok2 && f > 0 {
+			extraLines = append(extraLines, fmt.Sprintf("Altitude: %.0f m", f))
+		}
+		if b, ok2 := m["fogacho"].(bool); ok2 && b {
+			addTags = addTag(addTags, "sparkles")
+		}
+		if s := getPropStr(m, "fontealerta"); s != "" {
+			extraLines = append(extraLines, "Fonte: "+s)
+			s2 := strings.ToLower(stripAccents(s))
+			if strings.Contains(s2, "112") {
+				addTags = addTag(addTags, "telephone")
+			}
+			if strings.Contains(s2, "popular") {
+				addTags = addTag(addTags, "busts_in_silhouette")
+			}
+		}
+	}
+
+	// Aviacao
+	if hf, _ := toFloat(p["heliFight"]); hf > 0 {
+		addTags = addTag(addTags, "helicopter")
+	}
+	if hc, _ := toFloat(p["heliCoord"]); hc > 0 {
+		addTags = addTag(addTags, "helicopter")
+	}
+	if pf, _ := toFloat(p["planeFight"]); pf > 0 {
+		addTags = addTag(addTags, "airplane")
+	}
+	// Flag "important"
+	if imp := strings.ToLower(strings.TrimSpace(getPropStr(p, "important"))); imp == "true" || imp == "1" {
+		addTags = addTag(addTags, "exclamation")
+	}
+	return
 }

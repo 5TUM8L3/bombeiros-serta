@@ -6,31 +6,38 @@
     "covilha": [],
     "ferreiradozezere": [],
     "figueirodosvinhos": [],
-    "fundao": [
-      "20251181815"
-    ],
+    "fundao": [],
     "idanhaanova": [],
     "oleiros": [],
     "pampilhosadaserra": [],
-    "pedrogaogrande": [],
+    "pedrogaogrande": [
+      "20251185562"
+    ],
     "penamacor": [],
     "proencaanova": [],
-    "sardoal": [
-      "20251182111",
-      "20251182177"
-    ],
+    "sardoal": [],
     "serta": [],
     "viladerei": [],
     "vilavelhaderodao": []
   },
   "concluded": {
-    "20251182111": "2025-09-03T16:03:18Z",
-    "20251182177": "2025-09-03T15:46:52Z"
+    "20251185562": "2025-09-04T11:54:01Z"
+  },
+  "extra_text": {
+    "20251185562": ""
   },
   "first": {
-    "20251181815": "2025-09-03T14:31:02Z",
-    "20251182111": "2025-09-03T15:29:33Z",
-    "20251182177": "2025-09-03T15:46:52Z"
+    "20251185562": "2025-09-04T11:37:01Z"
+  },
+  "last_daily": "",
+  "last_hourly": "2025-09-04 13",
+  "means": {
+    "20251185562": {
+      "aerial": 0,
+      "aquatic": 0,
+      "man": 8,
+      "terrain": 3
+    }
   },
   "seen": {
     "belmonte": {},
@@ -39,26 +46,21 @@
     "covilha": {},
     "ferreiradozezere": {},
     "figueirodosvinhos": {},
-    "fundao": {
-      "20251181815": "2025-09-03T15:05:33Z"
-    },
+    "fundao": {},
     "idanhaanova": {},
     "oleiros": {},
     "pampilhosadaserra": {},
-    "pedrogaogrande": {},
+    "pedrogaogrande": {
+      "20251185562": "2025-09-04T12:00:29Z"
+    },
     "penamacor": {},
     "proencaanova": {},
-    "sardoal": {
-      "20251182111": "2025-09-03T16:03:18Z",
-      "20251182177": "2025-09-03T16:03:18Z"
-    },
+    "sardoal": {},
     "serta": {},
     "viladerei": {},
     "vilavelhaderodao": {}
   },
   "status": {
-    "20251181815": "Chegada ao TO",
-    "20251182111": "Conclusão",
-    "20251182177": "Conclusão"
+    "20251185562": "Conclusão"
   }
 }

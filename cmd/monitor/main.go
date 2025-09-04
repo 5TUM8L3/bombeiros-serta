@@ -716,6 +716,57 @@ func addTagsCSV(base, addCSV string) string {
 	return base
 }
 
+// Remove a tag from CSV if present (case-insensitive)
+func stripTagCSV(csv, tag string) string {
+	tag = strings.ToLower(strings.TrimSpace(tag))
+	if tag == "" || strings.TrimSpace(csv) == "" {
+		return csv
+	}
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		t := strings.TrimSpace(p)
+		if strings.ToLower(t) == tag || t == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return strings.Join(out, ",")
+}
+
+// Determine if incident is fire-related based on natureza/naturezaCode
+func isFireIncident(p map[string]any) bool {
+	code := strings.TrimSpace(getPropStr(p, "naturezaCode"))
+	name := strings.ToLower(stripAccents(getPropStr(p, "natureza")))
+	// Forest fires 31xx and rescaldo 3107 considered fire
+	if len(code) >= 2 && strings.HasPrefix(code, "31") {
+		return true
+	}
+	// Heuristics by name
+	if strings.Contains(name, "mato") || strings.Contains(name, "florest") || strings.Contains(name, "rescaldo") || strings.Contains(name, "queimada") || strings.Contains(name, "incend") {
+		return true
+	}
+	return false
+}
+
+// Adjust base tags by natureza (remove fire for non-fire; add simple category emoji)
+func adjustTagsForNature(base string, p map[string]any) string {
+	out := base
+	name := strings.ToLower(stripAccents(getPropStr(p, "natureza")))
+	if !isFireIncident(p) {
+		out = stripTagCSV(out, "fire")
+		// basic hints for common categories
+		if strings.Contains(name, "rodovi") || strings.Contains(name, "colis") || strings.Contains(name, "despiste") || strings.Contains(name, "atropel") {
+			out = addTag(out, "oncoming_automobile")
+		} else if strings.Contains(name, "arvore") || strings.Contains(name, "queda de arvore") {
+			out = addTag(out, "deciduous_tree")
+		} else if strings.Contains(name, "inund") {
+			out = addTag(out, "droplet")
+		}
+	}
+	return out
+}
+
 func getPropStr(p map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := p[k]; ok {
@@ -729,6 +780,40 @@ func getPropStr(p map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// ---- Portuguese-friendly formatting helpers ----
+func meansSummaryFromPropsPT(p map[string]any) string {
+	man := getPropStr(p, "man")
+	ter := getPropStr(p, "terrain")
+	air := getPropStr(p, "aerial")
+	aq := getPropStr(p, "meios_aquaticos")
+	return fmt.Sprintf("Operacionais=%s, Terrestres=%s, Aéreos=%s, Aquáticos=%s", man, ter, air, aq)
+}
+
+func aeronavesLineFromPropsPT(p map[string]any) string {
+	hf := getPropStr(p, "heliFight")
+	hc := getPropStr(p, "heliCoord")
+	pf := getPropStr(p, "planeFight")
+	if hf == "0" && hc == "0" && pf == "0" {
+		return ""
+	}
+	return fmt.Sprintf("Aeronaves: Combate=%s, Coordenação=%s, Aviões=%s", hf, hc, pf)
+}
+
+func appendMeansChangePartsPT(parts *[]string, oldM, newM Means) {
+	if oldM.Man != newM.Man {
+		*parts = append(*parts, fmt.Sprintf("Operacionais: %d → %d", oldM.Man, newM.Man))
+	}
+	if oldM.Terrain != newM.Terrain {
+		*parts = append(*parts, fmt.Sprintf("Terrestres: %d → %d", oldM.Terrain, newM.Terrain))
+	}
+	if oldM.Aerial != newM.Aerial {
+		*parts = append(*parts, fmt.Sprintf("Aéreos: %d → %d", oldM.Aerial, newM.Aerial))
+	}
+	if oldM.Aquatic != newM.Aquatic {
+		*parts = append(*parts, fmt.Sprintf("Aquáticos: %d → %d", oldM.Aquatic, newM.Aquatic))
+	}
 }
 
 // Extract a Fogos.pt incident URL from a notification body, if present
@@ -1384,6 +1469,8 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	tags := getenv("NTFY_TAGS", "fire,rotating_light")
 
 	perMuniNew := map[string][]Feature{}
+	// IDs currently present in the active filtered feed
+	presentIDs := map[string]struct{}{}
 	for _, f := range filtered {
 		mun := normMunicipio(getMunicipio(f.Properties))
 		// map syns to canonical key if needed
@@ -1397,6 +1484,9 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 			}
 		}
 		perMuniNew[canon] = append(perMuniNew[canon], f)
+		if id := getID(f.Properties); strings.TrimSpace(id) != "" {
+			presentIDs[id] = struct{}{}
+		}
 	}
 
 	// init existing
@@ -1580,17 +1670,17 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				p := ev.f.Properties
 				curStatus := getPropStr(p, "status")
 				prev := ev.prev
+				nature := getPropStr(p, "natureza")
 				title := fmt.Sprintf("%s → %s — %s", func() string {
 					if strings.TrimSpace(prev) == "" {
 						return "Novo"
 					}
 					return prev
 				}(), curStatus, ev.disp)
-				man := getPropStr(p, "man")
-				ter := getPropStr(p, "terrain")
-				air := getPropStr(p, "aerial")
-				aq := getPropStr(p, "meios_aquaticos")
-				body := fmt.Sprintf("ID: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, man, ter, air, aq)
+				if strings.TrimSpace(nature) != "" {
+					title += " — " + nature
+				}
+				body := fmt.Sprintf("ID: %s\nMeios: %s", ev.id, meansSummaryFromPropsPT(p))
 				infoTags, extraLines := extraInfoTags(p)
 				if len(extraLines) > 0 {
 					body += "\n" + strings.Join(extraLines, "\n")
@@ -1604,32 +1694,30 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				} else if strings.Contains(s, "vigilancia") || strings.Contains(s, "conclus") {
 					pr = "3"
 				}
-				tg, pr2 := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), pr)
+				baseTags := adjustTagsForNature(addTagsCSV(tags, infoTags), p)
+				tg, pr2 := enrichMeansTagsAndPriority(p, baseTags, pr)
 				if strings.Contains(s, "conclus") {
 					tg = addTag(tg, "white_check_mark")
 				}
-				postNtfyExt(ntfyURL, topic, title, body, tg, pr2, mapsURLForFeature(ev.f, ev.disp))
+				// Fogos link só para incêndios
+				click := mapsURLForFeature(ev.f, ev.disp)
+				if isFireIncident(p) && ev.id != "" {
+					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
+				}
+				postNtfyExt(ntfyURL, topic, title, body, tg, pr2, click)
 			}
 		} else {
 			for _, ev := range events {
 				p := ev.f.Properties
 				status := getPropStr(p, "status", "phase", "estado")
 				nature := getPropStr(p, "natureza", "type", "tipo")
-				man := getPropStr(p, "man")
-				ter := getPropStr(p, "terrain")
-				air := getPropStr(p, "aerial")
-				aq := getPropStr(p, "meios_aquaticos")
-				hf := getPropStr(p, "heliFight")
-				hc := getPropStr(p, "heliCoord")
-				pf := getPropStr(p, "planeFight")
 				title := fmt.Sprintf("Novo em %s — %s", ev.disp, nature)
 				if ev.when != "" {
 					title += " (" + ev.when + ")"
 				}
-				body := fmt.Sprintf("ID: %s\nMunicípio: %s\nEstado: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, ev.disp, status, man, ter, air, aq)
-				// aeronaves (se presentes)
-				if hf != "0" || hc != "0" || pf != "0" {
-					body += fmt.Sprintf("\nAeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf)
+				body := fmt.Sprintf("ID: %s\nMunicípio: %s\nEstado: %s\nMeios: %s", ev.id, ev.disp, status, meansSummaryFromPropsPT(p))
+				if al := aeronavesLineFromPropsPT(p); al != "" {
+					body += "\n" + al
 				}
 				// Extra
 				if extra := getPropStr(p, "extra"); extra != "" {
@@ -1652,11 +1740,13 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				}
 				body += fmt.Sprintf("\nTotal ativo no alvo: %d", len(filtered))
 				clickURL := mapsURLForFeature(ev.f, ev.disp)
-				if ev.id != "" {
+				// Só adicionar Fogos se for incêndio
+				if isFireIncident(p) && ev.id != "" {
 					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
 				}
 				// Enriquecer tags/prioridade
-				tg, pr := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), priority)
+				baseTags := adjustTagsForNature(addTagsCSV(tags, infoTags), p)
+				tg, pr := enrichMeansTagsAndPriority(p, baseTags, priority)
 				// Extra tags do 'extra'
 				if extra := getPropStr(p, "extra"); extra != "" {
 					if more, _ := parseExtraTags(extra); len(more) > 0 {
@@ -1672,22 +1762,19 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				p := ev.f.Properties
 				curStatus := getPropStr(p, "status")
 				prev := ev.prev
+				nature := getPropStr(p, "natureza")
 				title := fmt.Sprintf("%s → %s — %s", func() string {
 					if strings.TrimSpace(prev) == "" {
 						return "Novo"
 					}
 					return prev
 				}(), curStatus, ev.disp)
-				man := getPropStr(p, "man")
-				ter := getPropStr(p, "terrain")
-				air := getPropStr(p, "aerial")
-				aq := getPropStr(p, "meios_aquaticos")
-				hf := getPropStr(p, "heliFight")
-				hc := getPropStr(p, "heliCoord")
-				pf := getPropStr(p, "planeFight")
-				body := fmt.Sprintf("ID: %s\nMeios: man=%s, ter=%s, air=%s, aq=%s", ev.id, man, ter, air, aq)
-				if hf != "0" || hc != "0" || pf != "0" {
-					body += fmt.Sprintf("\nAeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf)
+				if strings.TrimSpace(nature) != "" {
+					title += " — " + nature
+				}
+				body := fmt.Sprintf("ID: %s\nMeios: %s", ev.id, meansSummaryFromPropsPT(p))
+				if al := aeronavesLineFromPropsPT(p); al != "" {
+					body += "\n" + al
 				}
 				// Extra
 				if extra := getPropStr(p, "extra"); extra != "" {
@@ -1701,8 +1788,8 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				if len(extraLines) > 0 {
 					body += "\n" + strings.Join(extraLines, "\n")
 				}
-				// Fogos link
-				if ev.id != "" {
+				// Fogos link só para incêndios
+				if isFireIncident(p) && ev.id != "" {
 					body += "\nFogos: https://fogos.pt/fogo/" + ev.id
 				}
 				// Ajuste de prioridade por status
@@ -1715,7 +1802,8 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				} else if strings.Contains(s, "vigilancia") || strings.Contains(s, "conclus") {
 					pr = "3"
 				}
-				tg, pr2 := enrichMeansTagsAndPriority(p, addTagsCSV(tags, infoTags), pr)
+				baseTags := adjustTagsForNature(addTagsCSV(tags, infoTags), p)
+				tg, pr2 := enrichMeansTagsAndPriority(p, baseTags, pr)
 				prevS := strings.ToLower(stripAccents(prev))
 				if (strings.Contains(prevS, "conclus") || strings.Contains(prevS, "vigil")) && (strings.Contains(s, "curso") || strings.Contains(s, "despacho")) {
 					tg = addTag(tg, "repeat")
@@ -1740,25 +1828,11 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 			if getenv("NOTIFY_MEANS_CHANGES", "1") != "0" {
 				for _, ev := range meansEvents {
 					parts := []string{}
-					if ev.old.Man != ev.new.Man {
-						parts = append(parts, fmt.Sprintf("man: %d → %d", ev.old.Man, ev.new.Man))
-					}
-					if ev.old.Terrain != ev.new.Terrain {
-						parts = append(parts, fmt.Sprintf("ter: %d → %d", ev.old.Terrain, ev.new.Terrain))
-					}
-					if ev.old.Aerial != ev.new.Aerial {
-						parts = append(parts, fmt.Sprintf("air: %d → %d", ev.old.Aerial, ev.new.Aerial))
-					}
-					if ev.old.Aquatic != ev.new.Aquatic {
-						parts = append(parts, fmt.Sprintf("aq: %d → %d", ev.old.Aquatic, ev.new.Aquatic))
-					}
+					appendMeansChangePartsPT(&parts, ev.old, ev.new)
 					// incluir aeronaves se existirem nos props atuais
 					p := ev.f.Properties
-					hf := getPropStr(p, "heliFight")
-					hc := getPropStr(p, "heliCoord")
-					pf := getPropStr(p, "planeFight")
-					if hf != "0" || hc != "0" || pf != "0" {
-						parts = append(parts, fmt.Sprintf("aeronaves: heliFight=%s, heliCoord=%s, planeFight=%s", hf, hc, pf))
+					if al := aeronavesLineFromPropsPT(p); al != "" {
+						parts = append(parts, al)
 					}
 					if len(parts) == 0 {
 						continue
@@ -1769,7 +1843,8 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 					if len(extraLines) > 0 {
 						body += "\n" + strings.Join(extraLines, "\n")
 					}
-					tg, pr := enrichMeansTagsAndPriority(p, addTag(tags, infoTags), "3")
+					baseTags := adjustTagsForNature(addTag(tags, infoTags), p)
+					tg, pr := enrichMeansTagsAndPriority(p, baseTags, "3")
 					postNtfyExt(ntfyURL, topic, title, body, tg, pr, mapsURLForFeature(ev.f, ev.disp))
 				}
 			}
@@ -1784,7 +1859,8 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 					body := fmt.Sprintf("ID: %s\nExtra: %s", ev.id, strings.TrimSpace(ev.new))
 					// tags adicionais do 'extra' (ex.: estrada cortada)
 					more, _ := parseExtraTags(ev.new)
-					tg := tags
+					baseTags := adjustTagsForNature(tags, ev.f.Properties)
+					tg := baseTags
 					for _, t := range more {
 						tg = addTag(tg, t)
 					}
@@ -1794,9 +1870,27 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 		}
 	}
 
+	// Cleanup: remove incidents that no longer appear in the active list (keep JSON lean)
+	pruned := 0
+	if getenv("CLEAN_FINISHED", "1") != "0" {
+		for muni, set := range st {
+			for id := range set {
+				if _, ok := presentIDs[id]; !ok {
+					delete(st[muni], id)
+					delete(seen[muni], id)
+					delete(lastStatusByID, id)
+					delete(firstSeenByID, id)
+					delete(concludedAtID, id)
+					delete(lastMeansByID, id)
+					delete(lastExtraByID, id)
+					pruned++
+				}
+			}
+		}
+	}
+
 	// TTL retention: prune old IDs
 	ttlHours, _ := strconv.ParseFloat(strings.TrimSpace(getenv("STATE_TTL_HOURS", "0")), 64)
-	pruned := 0
 	if ttlHours > 0 {
 		cutoff := now.Add(-time.Duration(ttlHours * float64(time.Hour)))
 		for muni, set := range st {
@@ -1805,6 +1899,11 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				if !ok || ts.Before(cutoff) {
 					delete(st[muni], id)
 					delete(seen[muni], id)
+					delete(lastStatusByID, id)
+					delete(firstSeenByID, id)
+					delete(concludedAtID, id)
+					delete(lastMeansByID, id)
+					delete(lastExtraByID, id)
 					pruned++
 				}
 			}
@@ -1831,7 +1930,7 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 	nowDay := now.Format("2006-01-02")
 	nowMin := now.Minute()
 
-	// Corrigido: só no minuto 0 e uma vez por hora, persistente
+	// Corrigido: só no minuto 0 e uma vez por hora, persistente; enviar apenas se houver ativos
 	if getenv("SUMMARY_HOURLY", "1") != "0" {
 		hourMark := now.Format("2006-01-02 15")
 		if nowMin == 0 && lastHourlyMark != hourMark {
@@ -1868,13 +1967,22 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 				return strings.Join(parts, ", ")
 			}
 			title := fmt.Sprintf("Sumário horário (%02d:00)", nowHour)
-			body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
-			postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "bar_chart"), "3", "")
-			lastHourlyMark = hourMark
+			count := len(filtered)
+			if count > 0 {
+				body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", count, mk(byConc), mk(byNat), mk(bySta))
+				sumTags := stripTagCSV(tags, "fire")
+				sumTags = addTag(sumTags, "bar_chart")
+				postNtfyExt(ntfyURL, topic, title, body, sumTags, "3", "")
+				lastHourlyMark = hourMark
+				// persist marks immediately to avoid duplicates when no incident changes
+				if err := saveLastState(statePath, st, seen); err != nil {
+					fmt.Fprintln(os.Stderr, "Erro a gravar estado:", err)
+				}
+			}
 		}
 	}
 
-	// Corrigido: diário apenas às 08:00 em ponto e uma vez por dia
+	// Corrigido: diário apenas às 08:00 em ponto e uma vez por dia; enviar apenas se houver ativos
 	if getenv("SUMMARY_DAILY", "1") != "0" && lastSummaryDay != nowDay && nowHour == 8 && nowMin == 0 {
 		byConc := map[string]int{}
 		byNat := map[string]int{}
@@ -1908,9 +2016,18 @@ func runOnce(statePath string, wantedNames []string) (changed bool, err error) {
 			return strings.Join(parts, "; ")
 		}
 		title := fmt.Sprintf("Sumário diário (%s)", nowDay)
-		body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", len(filtered), mk(byConc), mk(byNat), mk(bySta))
-		postNtfyExt(ntfyURL, topic, title, body, addTag(tags, "calendar"), "3", "")
-		lastSummaryDay = nowDay
+		count := len(filtered)
+		if count > 0 {
+			body := fmt.Sprintf("Ativos: %d\nConcelhos: %s\nNatureza: %s\nEstados: %s", count, mk(byConc), mk(byNat), mk(bySta))
+			sumTags := stripTagCSV(tags, "fire")
+			sumTags = addTag(sumTags, "calendar")
+			postNtfyExt(ntfyURL, topic, title, body, sumTags, "3", "")
+			lastSummaryDay = nowDay
+			// persist immediately
+			if err := saveLastState(statePath, st, seen); err != nil {
+				fmt.Fprintln(os.Stderr, "Erro a gravar estado:", err)
+			}
+		}
 	}
 
 	// Save state when there were new events or TTL pruned entries

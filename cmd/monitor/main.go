@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"context"
+	"runtime"
 	"unicode"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -2050,8 +2051,18 @@ func main() {
 	if !filepath.IsAbs(stateFile) {
 		stateFile = filepath.Join(".", stateFile)
 	}
+	// Determine tray mode early (Windows defaults to tray; disable with USE_TRAY=0)
+	isWindows := strings.EqualFold(runtime.GOOS, "windows")
+	isTray := isWindows && getenv("USE_TRAY", "1") != "0"
+	if isTray {
+		// Hide console immediately to avoid any taskbar flash
+		hideConsoleWindow()
+	}
+
 	wanted := wantedMunicipiosFromEnv()
-	fmt.Printf("Monitor a cada %ds para: %s\n", pollSec, muniLabel(wanted))
+	if !isTray {
+		fmt.Printf("Monitor a cada %ds para: %s\n", pollSec, muniLabel(wanted))
+	}
 
 	// Teste opcional de notificação no arranque (defina NTFY_TEST=1)
 	if getenv("NTFY_TEST", "") != "" {
@@ -2068,22 +2079,36 @@ func main() {
 				fmt.Fprintln(os.Stderr, "metrics server error:", err)
 			}
 		}()
-		fmt.Println("Métricas Prometheus em", getenv("METRICS_ADDR", ":2112"), "/metrics")
+		if !isTray {
+			fmt.Println("Métricas Prometheus em", getenv("METRICS_ADDR", ":2112"), "/metrics")
+		}
 	}
 
 	// Graceful shutdown on Ctrl+C / SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Windows: tray mode by default. Disable with USE_TRAY=0.
+	if isTray {
+		go runMonitor(ctx, pollSec, stateFile, wanted)
+		StartTray(func() {
+			stop()
+		})
+		return
+	}
+
+	runMonitor(ctx, pollSec, stateFile, wanted)
+}
+
+// runMonitor executes the polling loop until ctx is canceled.
+func runMonitor(ctx context.Context, pollSec int, stateFile string, wanted []string) {
 	if pollSec <= 0 {
-		_, err := runOnce(stateFile, wanted)
-		if err != nil {
+		if _, err := runOnce(stateFile, wanted); err != nil {
 			fmt.Fprintln(os.Stderr, "Erro:", err)
 			os.Exit(1)
 		}
 		return
 	}
-
 	ticker := time.NewTicker(time.Duration(pollSec) * time.Second)
 	defer ticker.Stop()
 	for {
@@ -2092,7 +2117,6 @@ func main() {
 		}
 		select {
 		case <-ticker.C:
-			// continue loop
 		case <-ctx.Done():
 			fmt.Println("A terminar...")
 			return

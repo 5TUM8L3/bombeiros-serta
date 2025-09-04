@@ -10,9 +10,7 @@
     "idanhaanova": [],
     "oleiros": [],
     "pampilhosadaserra": [],
-    "pedrogaogrande": [
-      "20251185562"
-    ],
+    "pedrogaogrande": [],
     "penamacor": [],
     "proencaanova": [],
     "sardoal": [],
@@ -20,25 +18,12 @@
     "viladerei": [],
     "vilavelhaderodao": []
   },
-  "concluded": {
-    "20251185562": "2025-09-04T11:54:01Z"
-  },
-  "extra_text": {
-    "20251185562": ""
-  },
-  "first": {
-    "20251185562": "2025-09-04T11:37:01Z"
-  },
+  "concluded": {},
+  "extra_text": {},
+  "first": {},
   "last_daily": "",
   "last_hourly": "2025-09-04 13",
-  "means": {
-    "20251185562": {
-      "aerial": 0,
-      "aquatic": 0,
-      "man": 8,
-      "terrain": 3
-    }
-  },
+  "means": {},
   "seen": {
     "belmonte": {},
     "castanheiradepera": {},
@@ -50,9 +35,7 @@
     "idanhaanova": {},
     "oleiros": {},
     "pampilhosadaserra": {},
-    "pedrogaogrande": {
-      "20251185562": "2025-09-04T12:00:29Z"
-    },
+    "pedrogaogrande": {},
     "penamacor": {},
     "proencaanova": {},
     "sardoal": {},
@@ -60,7 +43,5 @@
     "viladerei": {},
     "vilavelhaderodao": {}
   },
-  "status": {
-    "20251185562": "Conclusão"
-  }
+  "status": {}
 }
